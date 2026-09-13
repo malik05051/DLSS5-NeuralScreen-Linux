@@ -17,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 
+from _needs import needs_worker  # noqa: E402
+
 BASE = Path(__file__).resolve().parent.parent  # the project root
 sys.path.insert(0, str(BASE))  # the project modules (main.py, display.py, ...)
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ (autocheck)
@@ -85,6 +87,8 @@ def send_resize(worker, w: int, h: int, nr_small: bool, full_w: int = 0, full_h:
 
 
 def main() -> int:
+    if (skip := needs_worker()) is not None:
+        return skip
     failures = []
     params = dict(PROFILES["Strong / Cinematic"])
     header = struct.pack(HEADER_FMT, VIDEO_MAGIC, WORK_W, WORK_H, WARMUP, 0,

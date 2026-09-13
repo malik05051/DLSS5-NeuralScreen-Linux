@@ -19,7 +19,6 @@ Two rules the hard way:
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import struct
 import subprocess
@@ -31,7 +30,7 @@ import numpy as np
 
 import channels
 import settings_io
-from capture import (ScreenCapture, _refresh_dxcam_factory,
+from capture import (ScreenCapture, capture_window, refresh_outputs,
                      devicename_for_output_idx, monitor_size,
                      resolve_output_idx)
 from display import Display
@@ -41,7 +40,7 @@ from paths import NATIVE_DIR, WORKER_EXE
 from protocol import (HEADER_FMT, VIDEO_MAGIC, SharedFrameBuffer,
                       WorkerReader, _negotiate_shm, send_dda, send_resize)
 from settings_io import _work_size, hotkey_labels, nr_verdict
-from winapi import window_frame_rect
+from toplevels import window_frame_rect
 
 
 # Worker lines that always reach the shared log. These are the ones a user
@@ -122,16 +121,31 @@ def start_worker(params: dict, width: int, height: int, warmup: int,
     if not WORKER_EXE.is_file():
         raise FileNotFoundError(
             f"worker not found: {WORKER_EXE}\n"
-            "Copy nvngx.dll (the built worker) and nvngx_dlssnr.dll into native/."
+            "Build it with native/linux/build-host.sh, and put "
+            "nvngx_dlssnr.so in native/."
         )
-    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # The PipeWire remote is a file descriptor, and a file descriptor cannot
+    # travel down a pipe as a number. It is handed over the only way one
+    # crosses a process boundary here: inherited. The worker looks for it at
+    # descriptor 3, which is what NS_PW_FD names, and reads the node id out
+    # of the environment - both set by the caller in st.worker_env.
+    pass_fds: tuple = ()
+    env = dict(os.environ)
+    capture_fd = int(env.pop("NS_PW_FD_SOURCE", "-1") or -1)
+    if capture_fd >= 0:
+        # dup it to 3 in the child rather than passing whatever number it
+        # happens to have here: the worker should not have to be told.
+        pass_fds = (capture_fd,)
+        env["NS_PW_FD"] = str(capture_fd)
     worker = subprocess.Popen(
         [str(WORKER_EXE), "--live"],
         cwd=str(NATIVE_DIR),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        creationflags=creation_flags,
+        env=env,
+        pass_fds=pass_fds,
+        close_fds=True,
     )
     logs: list[str] = []
     stop = threading.Event()
@@ -447,14 +461,27 @@ def switch_monitor(st, new_monitor: int | str) -> None:
     rebuild_pipeline(st, f"Monitor {st.monitor}: {st.width}x{st.height}")
 
 
-def switch_window(st, hwnd: int) -> None:
-    """Point the capture at one window (hwnd) or back at the desktop (0).
+def switch_window(st, hwnd) -> None:
+    """Point the capture at one window, or back at the whole screen.
 
-    The window's capture size is not something to guess: GetWindowRect
-    includes the invisible resize borders and the DWM frame, while the
-    capture produces the compositor's own surface. So the running
-    worker is asked first (WGCW answers with the real size), and the
-    pipeline is rebuilt for exactly that.
+    `hwnd` is the opaque handle from toplevels.py, or a falsy value to go
+    back to the screen. The name is the Windows one and is kept throughout
+    the pipeline state; what it holds is no longer a number.
+
+    One thing genuinely changed here and it is worth being plain about. On
+    Windows the program picked the window itself and started a capture on
+    it. Here the *pixels* of a window can only come from the portal, and the
+    portal asks the user which window - that is the security model, not an
+    oversight. So the handle decides which window the overlay follows and
+    which row the menu highlights, while the compositor's picker decides
+    which window is captured. The two agree the moment the user picks the
+    one they clicked, and after that the restore token makes it silent:
+    st.window_token is handed back and the picker does not appear again.
+
+    The capture size is still not something to guess - a window's logical
+    size, its frame and the size its stream actually produces are three
+    different numbers - so the running worker is asked (WGCW answers with
+    the real one) and the pipeline is rebuilt for exactly that.
     """
     if hwnd and not st.want_dda:
         st.display.alert(UI_STRINGS[st.lang]["win_fail"])
@@ -468,15 +495,33 @@ def switch_window(st, hwnd: int) -> None:
     # enter_switch_mode is idempotent and covers the rebuild too.
     st.display.enter_switch_mode(st.output_rgba, *st.capture.resolution)
     if hwnd:
-        # A minimised window has nothing to capture: WGC would answer with
-        # the last size it had and then go silent. The list offers them
-        # (a menu showing one of five open programs reads as broken), so
-        # picking one restores it first and lets the frame arrive.
-        if ctypes.windll.user32.IsIconic(ctypes.c_void_p(hwnd)):
-            ctypes.windll.user32.ShowWindow(ctypes.c_void_p(hwnd), 9)  # SW_RESTORE
-            time.sleep(0.25)  # the window has to be drawn before it is measured
+        # A minimised window has nothing to capture, and the Windows build
+        # un-minimised it before measuring. There is no such call here: a
+        # Wayland client cannot raise, restore or otherwise touch another
+        # client's window, which is the same rule that removed the window
+        # list. What replaces it is that the user picked the window in the
+        # compositor's own picker moments ago, so it is in front of them by
+        # construction - and a stream that produces nothing is reported as
+        # a refusal below rather than guessed at.
+        # Ask the portal for a window stream. With a remembered token this
+        # returns in milliseconds and shows nothing; without one it puts the
+        # compositor's picker in front of the user, which is why the switch
+        # veil is already up.
+        session = capture_window(getattr(st, "window_token", ""))
+        if not session.ok:
+            st.display.alert(UI_STRINGS[st.lang]["win_fail"])
+            print("[main] the portal granted no window stream",
+                  file=sys.stderr)
+            st.display.exit_switch_mode()
+            return
+        if session.restore_token:
+            st.window_token = session.restore_token
+            st.cfg["window_token"] = session.restore_token
+        if getattr(st, "window_session", None) is not None:
+            st.window_session.close()
+        st.window_session = session
         try:
-            aw, ah = channels.probe_window_capture(st, hwnd)
+            aw, ah = channels.probe_window_capture(st, session.node_id)
         except Exception as exc:
             # The probe left the worker inside a WGCW session that
             # may be half-open: put the source back on the desktop
@@ -514,12 +559,19 @@ def switch_window(st, hwnd: int) -> None:
                 st.follow_size = rect[2:]
             return
         teardown_pipeline(st)
-        st.window_hwnd = int(hwnd)
+        st.window_hwnd = hwnd
         st.width, st.height = int(aw), int(ah)
         note = UI_STRINGS[st.lang]["win_mode_on"]
     else:
         teardown_pipeline(st)
         st.window_hwnd = None
+        if getattr(st, "window_session", None) is not None:
+            # The grant is released with the mode: a window stream left open
+            # keeps the compositor composing frames for nobody, and shows in
+            # the desktop's "being shared" indicator long after the user
+            # went back to full screen.
+            st.window_session.close()
+            st.window_session = None
         st.width, st.height = st.capture.resolution
         note = UI_STRINGS[st.lang]["win_mode_off"]
     st.work_w, st.work_h = _work_size(st.width, st.height, st.work_scale)
@@ -535,11 +587,19 @@ def switch_window(st, hwnd: int) -> None:
 
 
 def apply_spout(st, enabled: bool) -> None:
-    """Toggle the Spout2 bridge: the worker must be restarted.
+    """Toggle the PipeWire output node: the worker must be restarted.
 
-    The bridge is initialised once inside the worker process
-    (SpoutBridgeInit reads NS_SPOUT at startup) - there is no protocol
-    message for it, so the only way in or out is a fresh worker. The
+    This is what the Spout2 bridge became. Spout is a Windows mechanism -
+    a shared DirectX texture published under a name - and has no Linux
+    counterpart. PipeWire is the counterpart of the whole idea: the worker
+    publishes its output as a video source node, and OBS reads PipeWire
+    sources natively, with no plugin to install. The config key and the
+    environment variable keep their names so an existing config keeps
+    working.
+
+    The output node is created once inside the worker process (it reads
+    NS_SPOUT at startup) - there is no protocol message for it, so the only
+    way in or out is a fresh worker. The
     same path the monitor switch takes: teardown, set the environment,
     rebuild. The picture size does not change, so the overlay, the
     menu and the capture source survive.
@@ -699,14 +759,14 @@ def follow_monitor(st) -> None:
     print(f"[main] the monitor is now {size[0]}x{size[1]} "
           f"(was {st.width}x{st.height}) - rebuilding the pipeline")
     teardown_pipeline(st)
-    # The dxcam factory caches the outputs it enumerated at import, and a
-    # mode change is exactly what makes that cache wrong - a fresh capture
-    # built on it would come back at the old size.
+    # The output list is cached, and a mode change is exactly what makes
+    # that cache wrong - a fresh capture built on it would come back at the
+    # old size.
     try:
         st.capture.close()
     except Exception:
         pass
-    _refresh_dxcam_factory()
+    refresh_outputs()
     try:
         st.capture = ScreenCapture(monitor_idx=st.monitor)
     except Exception as exc:
@@ -834,10 +894,12 @@ def follow_window(st) -> None:
     if rect is None:
         return
     x, y, w, h = rect
-    if ctypes.windll.user32.IsIconic(ctypes.c_void_p(st.window_hwnd)):
-        # Minimised: the capture goes silent (the worker hides its own
-        # window for the same reason), so the HUD goes with it rather
-        # than floating over whatever is underneath.
+    if w <= 0 or h <= 0:
+        # Minimised, or on another workspace: the compositor reports the
+        # window with no area and the stream goes quiet, so the HUD goes
+        # with it rather than floating over whatever is underneath. On
+        # Windows this was IsIconic; here it is the geometry itself,
+        # because there is no call to ask.
         if st.display.is_visible():
             st.display.set_visible(False)
             st.follow_pos = None

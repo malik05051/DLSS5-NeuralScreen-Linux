@@ -39,10 +39,10 @@ def _drive(st, size, ticks, rebuilds, step=0.1):
     clock = {"t": 500.0}
     real = (pipeline.monitor_size, pipeline.teardown_pipeline,
             pipeline.rebuild_pipeline, pipeline.ScreenCapture,
-            pipeline._refresh_dxcam_factory, pipeline.time)
+            pipeline.refresh_outputs, pipeline.time)
     pipeline.monitor_size = lambda name: size(clock["t"]) if callable(size) else size
     pipeline.teardown_pipeline = lambda s: None
-    pipeline._refresh_dxcam_factory = lambda: None
+    pipeline.refresh_outputs = lambda: None
     pipeline.ScreenCapture = lambda monitor_idx=0: types.SimpleNamespace(
         devicename=r"\\.\DISPLAY1", resolution=NEW, monitor_idx=monitor_idx,
         close=lambda: None)
@@ -55,7 +55,7 @@ def _drive(st, size, ticks, rebuilds, step=0.1):
     finally:
         (pipeline.monitor_size, pipeline.teardown_pipeline,
          pipeline.rebuild_pipeline, pipeline.ScreenCapture,
-         pipeline._refresh_dxcam_factory, pipeline.time) = real
+         pipeline.refresh_outputs, pipeline.time) = real
 
 
 def main() -> int:

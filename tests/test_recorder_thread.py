@@ -21,6 +21,8 @@ sys.path.insert(0, str(BASE))  # the project modules (main.py, display.py, ...)
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ (autocheck)
 from recorder import VideoRecorder  # noqa: E402
 
+from _needs import needs_nvenc  # noqa: E402
+
 W, H = 1920, 1080
 FRAMES = 40
 FPS = 60.0
@@ -37,6 +39,8 @@ def make_frame(i: int) -> np.ndarray:
 
 
 def main() -> int:
+    if (skip := needs_nvenc()) is not None:
+        return skip
     failures = []
     out = Path(tempfile.gettempdir()) / "ns-test-recorder.mp4"
     out.unlink(missing_ok=True)

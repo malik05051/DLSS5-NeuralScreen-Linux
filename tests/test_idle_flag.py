@@ -12,7 +12,7 @@ genuinely idling - the confusion the flag was added to remove.
 Expected: idle stays True until the "[skip] the screen changed" line.
 [audit cpp-worker]
 
-Run:  runtime\\python.exe tests\\test_idle_flag.py
+Run:  python3 tests\\test_idle_flag.py
 """
 import sys
 import types

@@ -89,7 +89,14 @@ def key_text(event) -> str | None:
                 "left shift", "right shift", "left meta", "right meta"):
         return None
     base = _KEY_ALIASES.get(name, name.upper())
-    mods = pygame.key.get_mods()
+    # The modifiers ride on the event. pygame.key.get_mods() asks SDL, and
+    # SDL is not running a window in this build - the keyboard comes from
+    # wl_keyboard, and wayland_shell puts the xkb modifier state on every
+    # event it builds. Falling back to SDL keeps this usable from a test
+    # that synthesises an ordinary pygame event.
+    mods = getattr(event, "mod", None)
+    if mods is None:
+        mods = pygame.key.get_mods()
     parts = []
     if mods & pygame.KMOD_CTRL:
         parts.append("Ctrl")
@@ -292,7 +299,7 @@ class OverlayMenu:
         self._opt_thumb = pygame.Rect(0, 0, 0, 0)
         # The window under the cursor on the windows page: the hwnd whose
         # outline is highlighted on the real screen (None = nothing).
-        self.hover_window: int | None = None
+        self.hover_window: str | None = None
         # Menu page: the main window or the settings behind the gear.
         self.page = "main"
         # The command we are currently waiting for a keypress for (or None).
@@ -407,23 +414,19 @@ class OverlayMenu:
         return (r.x + r.w // 2, r.y + r.h // 2)
 
     def _capture_mouse(self, on: bool) -> None:
-        """Capture the mouse while dragging the panel by its title bar.
+        """Nothing to capture: an implicit grab is already in force.
 
-        Without it the drag dies the moment the cursor leaves the window:
-        pygame stops delivering MOUSEMOTION outside the window, and the
-        release click outside is lost too - the panel "stops and has to be
-        grabbed again" (user report). SetCapture keeps the events coming
-        until the button is released.
+        On Windows a drag died the moment the cursor left the window -
+        pygame stopped delivering MOUSEMOTION and the release click outside
+        was lost, so the panel "stops and has to be grabbed again" (user
+        report) - and SetCapture was the fix.
+
+        Wayland grants the same thing without being asked. A surface that
+        has a button pressed on it holds an implicit pointer grab until the
+        last button is released: motion and the release keep arriving here
+        even when the pointer is far outside. The overlay is also the size
+        of the whole output, so there is very little "outside" to leave.
         """
-        try:
-            import ctypes
-            hwnd = pygame.display.get_wm_info()["window"]
-            if on:
-                ctypes.windll.user32.SetCapture(hwnd)
-            else:
-                ctypes.windll.user32.ReleaseCapture()
-        except Exception:
-            pass
 
     # -- layout ------------------------------------------------------------
 
@@ -596,7 +599,7 @@ class OverlayMenu:
                     items.append(Item("option", "window",
                                       pygame.Rect(pad, cy, inner_w, row_h),
                                       payload=wname,
-                                      extra={"label": wname,
+                                      extra={"label": wname.split("\t", 1)[-1],
                                              "selected": wname == str(
                                                  self.state.get("window_current", ""))}))
                     cy += row_h + self._u(4)
@@ -1051,15 +1054,14 @@ class OverlayMenu:
         if event.type == pygame.MOUSEMOTION:
             self._mouse = event.pos
             # The windows page: hovering a row highlights the real window's
-            # outline on the screen. The hwnd is the hex prefix of the row.
+            # outline on the screen, where the compositor will say where the
+            # window is. The handle is the part before the tab.
             self.hover_window = None
             if self.page == "windows":
                 for it in self.items:
                     if it.kind == "option" and it.rect.collidepoint(event.pos):
-                        try:
-                            self.hover_window = int(str(it.payload).split(":")[0], 16)
-                        except (ValueError, IndexError):
-                            self.hover_window = None
+                        handle = str(it.payload).split("\t", 1)[0].strip()
+                        self.hover_window = handle or None
                         break
             if self._grip.collidepoint(event.pos):
                 self.hover = "grip"

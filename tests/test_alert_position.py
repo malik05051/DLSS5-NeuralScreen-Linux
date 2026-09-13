@@ -17,7 +17,7 @@ gets one, as high and as central as that window allows.
 Geometry only: _alert_rect is asked directly, with the monitor and the
 overlay's own position stubbed. No window, no worker.
 
-Run:  runtime\\python.exe tests\\test_alert_position.py
+Run:  python3 tests\\test_alert_position.py
 """
 import os
 import sys

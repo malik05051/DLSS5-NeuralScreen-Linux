@@ -22,7 +22,7 @@ frames at startup, because for it even the watchdog is the problem
 (audit F3 - the first revive brought 120 back and the restarts climbed
 to NR OFF). min(), not the constant.
 
-Run:  runtime\\python.exe tests\\test_rebuild_warmup.py
+Run:  python3 tests\\test_rebuild_warmup.py
 """
 import sys
 import types

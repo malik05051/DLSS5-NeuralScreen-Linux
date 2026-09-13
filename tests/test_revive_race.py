@@ -12,7 +12,7 @@ set it (False), so the HUD/tray then claim NR ON with no worker.
 Expected: at most one revive per failure; a successful user revive
 disarms the pending auto-revive. [audit F4]
 
-Run:  runtime\\python.exe tests\\test_revive_race.py
+Run:  python3 tests\\test_revive_race.py
 """
 import sys
 import types

@@ -21,7 +21,6 @@ the first frame arrives.
 """
 from __future__ import annotations
 
-import ctypes
 import os
 import queue
 import subprocess
@@ -38,7 +37,7 @@ from hotkeys import (HotkeyController, build_bindings,
                      describe as describe_hotkeys, numlock_needed,
                      numlock_on)
 from i18n import STRINGS as UI_STRINGS
-from paths import BASE_DIR
+from paths import BASE_DIR, log_path
 from pipeline import start_worker
 from protocol import SharedFrameBuffer, WorkerReader
 from recorder import VideoRecorder
@@ -55,7 +54,7 @@ from tray import TrayController
 # reads the log as a file rather than a window. Startup errors (a missing DLL
 # and the like) are additionally shown in a message box (see the bottom of
 # this file).
-LOG_PATH = BASE_DIR / "NeuralScreen.log"
+LOG_PATH = log_path()
 
 
 def _init_logging() -> None:
@@ -71,24 +70,28 @@ def _init_logging() -> None:
 def _apply_nr_dll(cfg: dict) -> None:
     """The swappable runtime: a configured nr_dll reaches the worker.
 
-    The worker loads nvngx_dlssnr.dll by name; NS_NR_DLL lets a different
+    The worker loads nvngx_dlssnr.so by name; NS_NR_DLL lets a different
     build be loaded without rebuilding the worker (the RHI
     dlss_manifest.json pattern). The path is put into the environment,
-    which subprocess inherits. Without the flag the bundled DLL stays the
-    default.
+    which subprocess inherits. Without the flag the bundled runtime stays
+    the default.
     """
     if cfg.get("nr_dll"):
         os.environ["NS_NR_DLL"] = str(cfg["nr_dll"])
 
 
 def _apply_spout_env(cfg: dict) -> None:
-    """The Spout2 bridge flag reaches the worker through the environment.
+    """The PipeWire-output flag reaches the worker through the environment.
 
-    SpoutBridgeInit in the worker reads NS_SPOUT once, at process start -
-    there is no protocol message for the bridge, so the config flag
-    becomes the environment before the first worker is launched (and
-    again on every restart, see pipeline.apply_spout). "0" and unset
-    both mean off; the worker treats anything but "1" as disabled.
+    The worker reads NS_SPOUT once, at process start - there is no protocol
+    message for the output node, so the config flag becomes the environment
+    before the first worker is launched (and again on every restart, see
+    pipeline.apply_spout). "0" and unset both mean off; the worker treats
+    anything but "1" as disabled.
+
+    The name is the Windows one, kept so an existing config and an existing
+    launch script keep working; what it switches on is a PipeWire video
+    source rather than a Spout2 shared texture. See pipeline.apply_spout.
     """
     os.environ["NS_SPOUT"] = "1" if cfg.get("spout") else "0"
 
@@ -97,10 +100,11 @@ def _apply_hdr_env(cfg: dict) -> None:
     """The HDR compatibility flag reaches the worker the same way.
 
     HdrEnabled() in the worker reads NS_HDR once, at process start, and
-    everything downstream of it is decided then: the duplication format,
-    the swap chain format, the colour space. So the switch goes through a
-    worker restart (pipeline.apply_hdr), exactly like the Spout bridge.
-    Off unless the config says otherwise - the mode is experimental.
+    everything downstream of it is decided then: which PipeWire format is
+    accepted, the swapchain format, the colour space. So the switch goes
+    through a worker restart (pipeline.apply_hdr), exactly like the
+    PipeWire output. Off unless the config says otherwise - the mode is
+    experimental.
     """
     os.environ["NS_HDR"] = "1" if cfg.get("hdr") else "0"
 
@@ -108,21 +112,34 @@ def _apply_hdr_env(cfg: dict) -> None:
 def _apply_monitor_env(capture) -> tuple[int, int]:
     """Publish the chosen monitor to the worker and return its origin.
 
-    Two separate hand-offs for the same subject:
+    Three hand-offs for the same subject:
 
-    * NS_OUTPUT - which DXGI output the worker's Desktop Duplication should
-      duplicate, by device name. Without it the worker duplicated output 0
-      (the primary monitor) while the client was built for the chosen one
-      (issues #28, #33).
-    * the origin - where the chosen monitor's corner sits on the virtual
-      desktop. The overlay is created at (0,0), which IS the primary: on a
-      second monitor the picture landed on the wrong screen. The caller
-      feeds it to Display.set_origin.
+    * NS_OUTPUT - the connector name of the monitor being processed
+      ("DP-1"), so the worker's own log names the same screen the menu
+      does.
+    * NS_PW_NODE and NS_PW_FD_SOURCE - the PipeWire node the portal
+      granted, and the descriptor to read it on. These are what actually
+      select the source: the worker does not go looking for a monitor, it
+      reads the stream it was handed. pipeline.start_worker turns the
+      second one into an inherited descriptor.
+    * the origin - where the chosen monitor's corner sits in the
+      compositor's logical space. The caller feeds it to
+      Display.set_origin.
 
-    A monitor whose name cannot be resolved keeps both defaults - the old
+    A monitor whose name cannot be resolved keeps the defaults - the old
     behaviour - and says so in the log.
     """
     from capture import monitor_origin
+    node = getattr(capture, "node_id", -1)
+    fd = getattr(capture, "pipewire_fd", -1)
+    if node is not None and node >= 0:
+        os.environ["NS_PW_NODE"] = str(node)
+    else:
+        os.environ.pop("NS_PW_NODE", None)
+    if fd is not None and fd >= 0:
+        os.environ["NS_PW_FD_SOURCE"] = str(fd)
+    else:
+        os.environ.pop("NS_PW_FD_SOURCE", None)
     name = getattr(capture, "devicename", "") or ""
     if name:
         os.environ["NS_OUTPUT"] = name
@@ -140,11 +157,11 @@ def _apply_monitor_env(capture) -> tuple[int, int]:
 def _apply_gpu_env(cfg: dict) -> None:
     """Which card the worker runs on, through the environment.
 
-    NS_GPU is read once per worker process - the adapter is chosen before
-    the device exists - so the config flag becomes the environment before
-    the first worker is launched, and again on every restart (see
-    pipeline.apply_gpu). Unset means the worker's own default: the first
-    NVIDIA adapter for the network, adapter 0 for the capture.
+    NS_GPU is read once per worker process - the Vulkan physical device is
+    chosen before the logical device exists - so the config flag becomes
+    the environment before the first worker is launched, and again on every
+    restart (see pipeline.apply_gpu). Unset means the worker's own default:
+    the first NVIDIA device that can import the stream's buffers.
     """
     gpu = cfg.get("gpu")
     if gpu is None:
@@ -154,78 +171,80 @@ def _apply_gpu_env(cfg: dict) -> None:
 
 
 def _log_environment(cfg: dict) -> None:
-    """Print the environment header into the log: version, OS, HDR, driver.
+    """Print the environment header into the log: version, session, GPU.
 
     Users paste NeuralScreen.log into issues; the header answers the
-    questions we would otherwise have to ask (which version, which
-    Windows, is HDR on, which driver). Every probe is wrapped: a missing
-    API or a stripped system must not crash the startup - the line is
-    simply skipped.
+    questions we would otherwise have to ask. On Windows those were the
+    build number, the driver version out of the display-class registry key
+    and whether HDR was on in the monitor data store - three registry
+    walks. Here the same facts come from places that are meant to be read:
+    the compositor names itself in the environment, NVML knows the driver,
+    and the portal knows which backend is answering.
+
+    Every probe is wrapped: a missing library or a stripped system must not
+    crash the startup - the line is simply skipped.
     """
     try:
         import platform
-        import sys as _sys
-        win = _sys.getwindowsversion()
-        print(f"[env] NeuralScreen {APP_VERSION} | Windows {win.major}.{win.minor} "
-              f"(build {win.build}) | {platform.platform()}")
-    except Exception:
-        print(f"[env] NeuralScreen {APP_VERSION} | Windows unknown")
-    try:
-        import gpuinfo
-        g = gpuinfo.probe()
-        print(f"[env] GPU: {g.get('name') or 'unknown'} "
-              f"({g.get('family') or '?'}, arch 0x{g.get('arch_group', 0):X})")
-    except Exception:
-        pass
-    try:
-        # The NVIDIA driver version from the display-class registry key.
-        import winreg
-        base = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
-        for idx in range(10):
-            try:
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                    f"{base}\\{idx:04d}") as key:
-                    desc, _ = winreg.QueryValueEx(key, "DriverDesc")
-                    if "NVIDIA" in str(desc):
-                        ver, _ = winreg.QueryValueEx(key, "DriverVersion")
-                        print(f"[env] driver: {ver}")
-                        break
-            except OSError:
-                continue
-    except Exception:
-        pass
-    try:
-        # HDR: the monitor data store in the registry carries HDREnabled.
-        # One read, no deep API digging - if the key is not there the
-        # line just says unknown.
-        import winreg
-        base = (r"SYSTEM\CurrentControlSet\Control\GraphicsDrivers"
-                r"\MonitorDataStore")
-        hdr = None
+
+        distro = ""
         try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as root:
-                for i in range(winreg.QueryInfoKey(root)[0]):
-                    try:
-                        with winreg.OpenKey(root, winreg.EnumKey(root, i)) as mon:
-                            try:
-                                val, _ = winreg.QueryValueEx(mon, "HDREnabled")
-                                hdr = bool(val)
-                                break
-                            except OSError:
-                                continue
-                    except OSError:
-                        continue
+            for line in open("/etc/os-release", encoding="utf-8"):
+                if line.startswith("PRETTY_NAME="):
+                    distro = line.split("=", 1)[1].strip().strip('"')
+                    break
         except OSError:
             pass
-        print(f"[env] HDR: {'on' if hdr else 'off' if hdr is not None else 'unknown'}")
+        print(f"[env] NeuralScreen {APP_VERSION} | {distro or 'Linux'} | "
+              f"{platform.platform()}")
+    except Exception:
+        print(f"[env] NeuralScreen {APP_VERSION} | Linux unknown")
+    try:
+        # Which compositor, and whether this is Wayland at all. The single
+        # most useful line in the log: nearly everything in this port
+        # behaves differently between wlroots, KDE and GNOME, and the
+        # answer is three environment variables away.
+        session = os.environ.get("XDG_SESSION_TYPE", "?")
+        desktop = (os.environ.get("XDG_CURRENT_DESKTOP")
+                   or os.environ.get("DESKTOP_SESSION") or "?")
+        display = os.environ.get("WAYLAND_DISPLAY") or "(none)"
+        print(f"[env] session: {session} | desktop: {desktop} | "
+              f"WAYLAND_DISPLAY: {display}")
     except Exception:
         pass
     try:
-        numlock = bool(ctypes.windll.user32.GetKeyState(0x90) & 1)
-        print(f"[env] Num Lock: {'on' if numlock else 'off'} | "
-              f"lang: {cfg.get('lang', 'en')} | "
+        import wlproto
+        from wayland_shell import SHELL
+
+        has_layer = SHELL.layer_shell is not None
+        why = "" if has_layer else f" ({wlproto.reason() or 'not offered'})"
+        print(f"[env] layer-shell: {'yes' if has_layer else 'no'}{why} | "
+              f"outputs: {len(SHELL.outputs)}")
+    except Exception:
+        pass
+    try:
+        import portal
+
+        print(f"[env] portal: ScreenCast v{portal._version('ScreenCast')} | "
+              f"GlobalShortcuts v{portal._version('GlobalShortcuts')} | "
+              f"FileChooser v{portal._version('FileChooser')}")
+    except Exception:
+        pass
+    try:
+        import gpuinfo
+
+        g = gpuinfo.probe()
+        cc = g.get("capability") or (0, 0)
+        print(f"[env] GPU: {g.get('name') or 'unknown'} "
+              f"({g.get('family') or '?'}, sm_{cc[0]}{cc[1]}) | "
+              f"driver: {g.get('driver') or 'unknown'}")
+    except Exception:
+        pass
+    try:
+        print(f"[env] lang: {cfg.get('lang', 'en')} | "
               f"profile: {cfg.get('profile', '?')} | "
-              f"work_scale: {cfg.get('work_scale', '?')}")
+              f"work_scale: {cfg.get('work_scale', '?')} | "
+              f"HDR: {'on' if cfg.get('hdr') else 'off'}")
     except Exception:
         pass
 
@@ -245,8 +264,11 @@ def configure(st) -> None:
     st.width, st.height = int(st.cfg["width"]), int(st.cfg["height"])
     monitor_cfg = st.cfg["monitor"]
     if isinstance(monitor_cfg, str):
-        # New configs store the DXGI devicename - resolve it to the current
-        # output index; a monitor that is not connected falls back to 0.
+        # New configs store the connector name ("DP-1") - resolve it to the
+        # current output index; a monitor that is not connected falls back
+        # to 0. A config carried over from the Windows build holds a DXGI
+        # name here, which resolves to nothing and lands on the same
+        # fallback - one picker prompt, then it is rewritten.
         st.monitor = resolve_output_idx(monitor_cfg)
         if st.monitor is None:
             print(f"[main] monitor {monitor_cfg!r} from config.json is not "
@@ -270,11 +292,11 @@ def configure(st) -> None:
     # the residual composite puts the detail back off the native frame.
     st.nr_small = bool(st.cfg.get("nr_small", True))
     os.environ["NS_NR_SMALL"] = "1" if st.nr_small else "0"
-    # The Spout2 bridge is the same story: the worker reads NS_SPOUT once
-    # at startup (SpoutBridgeInit), so the config flag becomes the
-    # environment before the first worker is launched. Off by default -
-    # the bridge costs a full-frame GPU copy on every Present, and it is
-    # only useful to someone recording through OBS.
+    # The PipeWire output is the same story: the worker reads NS_SPOUT
+    # once at startup, so the config flag becomes the environment before
+    # the first worker is launched. Off by default - publishing the output
+    # costs a full-frame copy per presented frame, and it is only useful to
+    # someone recording through OBS.
     _apply_spout_env(st.cfg)
     # And HDR compatibility, read once per worker process as well.
     _apply_hdr_env(st.cfg)
@@ -368,9 +390,12 @@ def bring_up(st) -> None:
 
     print(f"[main] capturing monitor {st.monitor}: {st.capture.resolution}")
 
-    st.display = Display(st.width, st.height, fullscreen=bool(st.cfg["fullscreen"]))
-    # The overlay is the size of one monitor and must sit ON it: created at
-    # (0,0) it covered the primary screen while the capture ran elsewhere.
+    st.display = Display(st.width, st.height,
+                         fullscreen=bool(st.cfg["fullscreen"]),
+                         output_name=getattr(st.capture, "devicename", ""))
+    # The overlay is anchored to the chosen output, so it cannot land on the
+    # wrong screen the way a window created at (0,0) could. The origin is
+    # still needed to place a captured window's frame inside it.
     st.display.set_origin(*st.mon_origin)
     st.display.set_lang(st.lang)
     # The program draws over the desktop and gives no sign of itself -
@@ -405,45 +430,57 @@ def bring_up(st) -> None:
     st.tray.start()
     print("[main] tray icon started")
 
-    # Taskbar button: the overlay and the worker window are tool
-    # windows, so the program lived only in the tray. A 1x1 APPWINDOW
-    # window gives the program a real taskbar button; clicking it sends
-    # the same "settings" command as a left click on the tray (user
-    # rule 2026-09-09: the program must always show in the taskbar).
+    # The desktop entry. The Windows build opened a 1x1 APPWINDOW window
+    # here to get a taskbar button, because neither the overlay nor the
+    # worker window showed in the taskbar. A layer surface is not a window
+    # and cannot be in a taskbar, and a decoy toplevel would give the user
+    # a blank window they can focus and close - so the launcher entry is
+    # what stands for "this program exists" instead. See taskbar.py.
     st.taskbar = TaskbarWindow(st.tray_commands, "NeuralScreen")
     st.taskbar.start()
-    print("[main] taskbar window started")
 
-    # Global hotkeys: RegisterHotKey rather than polling the key state.
-    # The system gives the keypress to us alone and does not pass it to the
-    # active application - Num1 inside a game toggles NR and the game never
-    # sees the key (the polling fallback does not swallow it, but the numpad
-    # is free in games). The commands go into the same queue the tray uses. The
-    # user's bindings come from config.json ("hotkeys": {"toggle": "Num1", ...}).
+    # Global hotkeys: the GlobalShortcuts portal rather than reading the
+    # keyboard. The compositor routes a bound shortcut to us and not to the
+    # focused application - Num1 inside a game toggles NR and the game never
+    # sees the key - and unlike RegisterHotKey the user can see and change
+    # every binding in their own desktop settings. Where there is no such
+    # portal the fallback reads /dev/input, which does not swallow the key;
+    # hotkeys.py says which path it took. The commands go into the same
+    # queue the tray uses. The user's preferred bindings come from
+    # config.json ("hotkeys": {"toggle": "Num1", ...}).
     hotkey_overrides = st.cfg.get("hotkeys")
     if not isinstance(hotkey_overrides, dict):
         hotkey_overrides = {}
     st.hotkey_bindings = build_bindings(hotkey_overrides)
     st.hotkeys = HotkeyController(st.tray_commands, st.hotkey_bindings)
-    st.hotkeys.start()
+    # The descriptions are what the user reads in their desktop's shortcuts
+    # dialog, so they are the menu's own localised command names.
+    # HOTKEY_ROWS already pairs every command with its i18n key, for the
+    # menu's own remapping page - the same pairing the shortcuts dialog
+    # needs, so it is read from there rather than duplicated.
+    from overlay_ui import HOTKEY_ROWS
+
+    st.hotkeys.start(labels={
+        cmd: UI_STRINGS[st.lang].get(key, cmd) for cmd, key in HOTKEY_ROWS})
     if st.hotkeys.registered:
         print(f"[main] hotkeys registered: {', '.join(st.hotkeys.registered)} "
               f"({describe_hotkeys(st.hotkey_bindings)})")
     if st.hotkeys.failed:
-        print(f"[main] hotkeys taken by another program: {', '.join(st.hotkeys.failed)}",
-              file=sys.stderr)
-    # The numpad sends different key codes with Num Lock off, so those
-    # bindings do not misbehave - they are simply absent. Say so, or it
-    # looks like the program ignores the keyboard.
-    numpad = numlock_needed(st.hotkey_bindings)
-    if numpad and not numlock_on():
-        print(f"[main] Num Lock is off: the numpad hotkeys "
-              f"({', '.join(numpad)}) will not fire until it is on",
-              file=sys.stderr)
-        st.display.alert(UI_STRINGS[st.lang]["numlock_off"], duration=6.0)
-    # The captions on the menu buttons come from the same bindings that were
-    # registered. Strictly after build_bindings: before that they do not exist.
-    st.display.menu.set_hotkeys(hotkey_labels(st.hotkey_bindings))
+        print(f"[main] the desktop bound no key for: "
+              f"{', '.join(st.hotkeys.failed)}", file=sys.stderr)
+    # The Num Lock warning is gone with the problem. On Windows the numpad
+    # with Num Lock off sent Insert/End/arrows, indistinguishable from the
+    # dedicated keys, so every numpad binding silently did nothing.
+    # Wayland delivers the keycode and KP_1 is KP_1 either way - see
+    # hotkeys.numlock_on, which is now a documented constant.
+    #
+    # The captions on the menu buttons: what the desktop ACTUALLY bound
+    # wins over what the config asked for, because the compositor and the
+    # user get the final say and a menu showing our wish would be lying.
+    labels = hotkey_labels(st.hotkey_bindings)
+    labels.update({cmd: trigger for cmd, trigger
+                   in st.hotkeys.effective().items() if trigger})
+    st.display.menu.set_hotkeys(labels)
 
     # The settings live in the overlay menu (Num2). There is no separate
     # window any more: it was a second interface over the same fields, it

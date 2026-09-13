@@ -1,106 +1,177 @@
-"""GPU model and architecture, through nvapi, with no external processes.
+"""GPU model and architecture, through NVML, with no external processes.
 
 The interface needs it: to show what we are running on and whether Neural
-Rendering is available. The architecture is read the same way NVIDIA's own
-library reads it (nvapi_QueryInterface -> NvAPI_GPU_GetArchInfo), so the
-value matches the one it makes its decision on.
+Rendering is available. On Windows this asked nvapi, because nvapi is what
+NVIDIA's own libraries ask and the answer therefore matched the decision
+they make. NVML is the Linux equivalent and ships in the same driver
+package - `libnvidia-ml.so.1` sits next to the kernel module - so nothing
+here depends on the CUDA toolkit or on nvidia-smi being installed.
 
-Everything is wrapped in try: without nvapi (a non-NVIDIA machine, a
-stripped driver) the module returns empty fields instead of taking the
-program down.
+NVML does not expose an architecture id the way nvapi's GetArchInfo did; it
+exposes a compute capability, which is the same information under a
+different name. sm_75 is Turing, sm_86 Ampere, sm_89 Ada, sm_120 Blackwell -
+and those are literally the kernels the NR runtime carries, so deriving the
+verdict from them is closer to the truth than mapping through an
+architecture table was.
+
+Everything is wrapped in try: without NVML (a non-NVIDIA machine, the
+nouveau driver, a container without the device nodes) the module returns
+empty fields instead of taking the program down.
 """
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 
-# nvapi function ids are hashes of their names
-_ID_INITIALIZE = 0x0150E828
-_ID_ENUM_GPUS = 0xE5AC921F
-_ID_GET_ARCH = 0xD8265D24
-_ID_GET_NAME = 0xCEEE8E9F
 
-# NV_GPU_ARCHITECTURE_ID: the group lives in the high bits. Neural Rendering
-# (feature 18) officially requires Blackwell — see NGXGpuArchitecture inside
-# nvngx_dlssnr.dll itself. Verified against NVIDIA's nvapi.h (TU100=0x160,
-# GA100=0x170, AD100=0x190, GB200=0x1B0) and open-gpu-kernel-modules
-# nv_arch.h (Turing=0x160, Ampere=0x170, Hopper=0x180, Ada=0x190,
-# Blackwell GB1XX=0x1A0, GB2XX=0x1B0). Real-user logs confirm: RTX 2070
-# reports 0x160, RTX 3060 Ti reports 0x170.
-ARCH_NAMES = {
-    0x160: ("Turing", "20xx"),
-    0x170: ("Ampere", "30xx"),
-    0x180: ("Hopper", ""),
-    0x190: ("Ada", "40xx"),
-    0x1A0: ("Blackwell", "50xx"),
-    0x1B0: ("Blackwell", "50xx"),
-    0x1C0: ("Blackwell", "50xx"),
+# Compute capability (major, minor) -> (architecture, marketing family).
+# Verified against the kernels inside the NR runtime itself: it carries
+# sm_75/86/89/120, which is Turing through Blackwell.
+ARCH_BY_CC = {
+    (7, 5): ("Turing", "20xx"),
+    (8, 0): ("Ampere", ""),
+    (8, 6): ("Ampere", "30xx"),
+    (8, 7): ("Ampere", ""),
+    (8, 9): ("Ada", "40xx"),
+    (9, 0): ("Hopper", ""),
+    (10, 0): ("Blackwell", ""),
+    (12, 0): ("Blackwell", "50xx"),
+}
+
+#: Neural Rendering officially requires Blackwell - see NGXGpuArchitecture
+#: inside the NR runtime. Compute capability 10.0 is the first Blackwell.
+CC_BLACKWELL = (10, 0)
+
+#: Kept for the call sites that still speak in nvapi architecture groups
+#: (the menu's verdict text, the tests). The numbers are nvapi's own.
+ARCH_GROUPS = {
+    "Turing": 0x160, "Ampere": 0x170, "Hopper": 0x180,
+    "Ada": 0x190, "Blackwell": 0x1A0,
 }
 ARCH_BLACKWELL = 0x1A0
 
 
-class _ArchInfo(ctypes.Structure):
-    _fields_ = [("version", ctypes.c_uint32),
-                ("architecture", ctypes.c_uint32),
-                ("implementation", ctypes.c_uint32),
-                ("revision", ctypes.c_uint32)]
+class _NVML:
+    """The handful of NVML entry points this needs, bound lazily."""
+
+    def __init__(self):
+        self.lib = None
+        for name in ("libnvidia-ml.so.1", "libnvidia-ml.so",
+                     ctypes.util.find_library("nvidia-ml")):
+            if not name:
+                continue
+            try:
+                self.lib = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        self.ok = False
+        if self.lib is None:
+            return
+        try:
+            # nvmlInit_v2 is the current symbol; the unversioned one is a
+            # compatibility shim that some stripped driver packages drop.
+            init = getattr(self.lib, "nvmlInit_v2", None) or self.lib.nvmlInit
+            self.ok = init() == 0
+        except Exception:
+            self.ok = False
+
+    def shutdown(self) -> None:
+        if self.ok and self.lib is not None:
+            try:
+                self.lib.nvmlShutdown()
+            except Exception:
+                pass
+            self.ok = False
 
 
-def probe() -> dict:
+def _handles(nvml: _NVML) -> list:
+    count = ctypes.c_uint(0)
+    if nvml.lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0:
+        return []
+    out = []
+    for index in range(count.value):
+        handle = ctypes.c_void_p()
+        if nvml.lib.nvmlDeviceGetHandleByIndex_v2(
+                index, ctypes.byref(handle)) == 0:
+            out.append(handle)
+    return out
+
+
+def _name(nvml: _NVML, handle) -> str:
+    buf = ctypes.create_string_buffer(96)
+    if nvml.lib.nvmlDeviceGetName(handle, buf, 96) != 0:
+        return ""
+    # "NVIDIA GeForce RTX 5070 Ti" -> "RTX 5070 Ti": the full name does not
+    # fit the menu line, and the vendor adds nothing there.
+    name = buf.value.decode("utf-8", "replace").strip()
+    for prefix in ("NVIDIA GeForce ", "NVIDIA "):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _capability(nvml: _NVML, handle) -> tuple[int, int]:
+    major, minor = ctypes.c_int(0), ctypes.c_int(0)
+    if nvml.lib.nvmlDeviceGetCudaComputeCapability(
+            handle, ctypes.byref(major), ctypes.byref(minor)) != 0:
+        return (0, 0)
+    return (major.value, minor.value)
+
+
+def list_gpus() -> list[tuple[int, str]]:
+    """Every NVIDIA card as [(index, name), ...], in NVML order.
+
+    The index is the one the worker's NS_GPU takes; on Linux it is also the
+    CUDA device order, so the menu, the log and the environment variable all
+    mean the same number - one translation fewer than the DXGI adapter index
+    needed on Windows.
+    """
+    nvml = _NVML()
+    if not nvml.ok:
+        return []
+    try:
+        return [(index, _name(nvml, handle) or f"NVIDIA device {index}")
+                for index, handle in enumerate(_handles(nvml))]
+    except Exception:
+        return []
+    finally:
+        nvml.shutdown()
+
+
+def probe(index: int = 0) -> dict:
     """{name, arch, arch_group, family, official} — empty fields on failure."""
     out = {"name": "", "arch": "", "arch_group": 0, "family": "",
-           "official": False}
+           "official": False, "capability": (0, 0), "driver": ""}
+    nvml = _NVML()
+    if not nvml.ok:
+        return out
     try:
-        nvapi = ctypes.WinDLL("nvapi64.dll")
-        qi = nvapi.nvapi_QueryInterface
-        qi.restype = ctypes.c_void_p
-        qi.argtypes = [ctypes.c_uint32]
-
-        p_init, p_enum = qi(_ID_INITIALIZE), qi(_ID_ENUM_GPUS)
-        if not p_init or not p_enum:
+        handles = _handles(nvml)
+        if not handles or index >= len(handles):
             return out
-        if ctypes.CFUNCTYPE(ctypes.c_int)(p_init)() != 0:
-            return out
-
-        handles = (ctypes.c_void_p * 64)()
-        count = ctypes.c_uint32(0)
-        enum = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(ctypes.c_void_p),
-                                ctypes.POINTER(ctypes.c_uint32))(p_enum)
-        if enum(handles, ctypes.byref(count)) != 0 or count.value == 0:
-            return out
-        gpu = handles[0]
-
-        p_name = qi(_ID_GET_NAME)
-        if p_name:
-            buf = ctypes.create_string_buffer(64)
-            fn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
-                                  ctypes.c_char_p)(p_name)
-            if fn(gpu, buf) == 0:
-                # "NVIDIA GeForce RTX 5070 Ti" -> "RTX 5070 Ti": the full name
-                # does not fit the menu line, and the vendor adds nothing there.
-                name = buf.value.decode("ascii", "replace").strip()
-                for prefix in ("NVIDIA GeForce ", "NVIDIA "):
-                    if name.startswith(prefix):
-                        name = name[len(prefix):]
-                        break
-                out["name"] = name
-
-        p_arch = qi(_ID_GET_ARCH)
-        if p_arch:
-            fn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p,
-                                  ctypes.POINTER(_ArchInfo))(p_arch)
-            for ver in (2, 1):
-                info = _ArchInfo()
-                info.version = ctypes.sizeof(_ArchInfo) | (ver << 16)
-                if fn(gpu, ctypes.byref(info)) == 0:
-                    group = info.architecture & 0xFFFFFFF0
-                    arch, family = ARCH_NAMES.get(group, ("", ""))
-                    out["arch_group"] = group
-                    out["arch"] = arch
-                    out["family"] = family
-                    out["official"] = group >= ARCH_BLACKWELL
-                    break
+        handle = handles[index]
+        out["name"] = _name(nvml, handle)
+        capability = _capability(nvml, handle)
+        out["capability"] = capability
+        arch, family = ARCH_BY_CC.get(capability, ("", ""))
+        if not arch and capability[0]:
+            # An architecture newer than this table: say Blackwell-or-later
+            # rather than nothing. Being wrong about the marketing name is
+            # better than a menu that claims not to know the card it is
+            # running on.
+            arch = "Blackwell" if capability >= CC_BLACKWELL else ""
+        out["arch"] = arch
+        out["family"] = family
+        out["arch_group"] = ARCH_GROUPS.get(arch, 0)
+        out["official"] = capability >= CC_BLACKWELL
+        buf = ctypes.create_string_buffer(80)
+        if nvml.lib.nvmlSystemGetDriverVersion(buf, 80) == 0:
+            out["driver"] = buf.value.decode("ascii", "replace").strip()
     except Exception:
         return out
+    finally:
+        nvml.shutdown()
     return out
 
 
@@ -118,5 +189,8 @@ def describe(info: dict) -> str:
 if __name__ == "__main__":
     got = probe()
     print(describe(got) or "unknown GPU")
-    print(f"group 0x{got['arch_group']:X}, officially supported: "
-          f"{'yes' if got['official'] else 'no'}")
+    cc = got["capability"]
+    print(f"compute capability {cc[0]}.{cc[1]}, driver {got['driver'] or '?'}, "
+          f"officially supported: {'yes' if got['official'] else 'no'}")
+    for index, name in list_gpus():
+        print(f"  {index}: {name}")

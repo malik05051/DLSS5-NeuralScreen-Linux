@@ -10,7 +10,7 @@ or a shape mismatch through guides' guard).
 Expected: the set of flags reset in rebuild_pipeline equals the set the
 loop's negotiation block reads. [audit python-core F8]
 
-Run:  runtime\\python.exe tests\\test_channel_flags.py
+Run:  python3 tests\\test_channel_flags.py
 """
 import re
 import sys

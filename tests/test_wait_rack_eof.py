@@ -9,7 +9,7 @@ not as a dead worker.
 Expected: EOFError arrives almost immediately (well before the timeout).
 [audit F7]
 
-Run:  runtime\\python.exe tests\\test_wait_rack_eof.py
+Run:  python3 tests\\test_wait_rack_eof.py
 """
 import io
 import sys

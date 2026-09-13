@@ -13,7 +13,7 @@ Expected: a state built the way bring_up builds it drives follow_monitor
 without raising; exactly one rebuild happens; the pending size clears.
 [audit F2/F9]
 
-Run:  runtime\\python.exe tests\\test_follow_monitor_init.py
+Run:  python3 tests\\test_follow_monitor_init.py
 """
 import shutil
 import sys
@@ -73,7 +73,7 @@ def main() -> int:
         "size": pipeline.monitor_size,
         "teardown": pipeline.teardown_pipeline,
         "rebuild": pipeline.rebuild_pipeline,
-        "refresh": pipeline._refresh_dxcam_factory,
+        "refresh": pipeline.refresh_outputs,
         "screen": pipeline.ScreenCapture,
     }
     try:
@@ -83,7 +83,7 @@ def main() -> int:
             "teardown", calls["teardown"] + 1)
         pipeline.rebuild_pipeline = lambda s, note: calls.__setitem__(
             "rebuild", calls["rebuild"] + 1)
-        pipeline._refresh_dxcam_factory = lambda: calls.__setitem__(
+        pipeline.refresh_outputs = lambda: calls.__setitem__(
             "refresh", calls["refresh"] + 1)
         pipeline.ScreenCapture = _Cap
 
@@ -104,7 +104,7 @@ def main() -> int:
         pipeline.monitor_size = real["size"]
         pipeline.teardown_pipeline = real["teardown"]
         pipeline.rebuild_pipeline = real["rebuild"]
-        pipeline._refresh_dxcam_factory = real["refresh"]
+        pipeline.refresh_outputs = real["refresh"]
         pipeline.ScreenCapture = real["screen"]
 
     if not failures:

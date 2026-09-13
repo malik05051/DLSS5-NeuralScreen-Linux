@@ -20,7 +20,7 @@ languages, on both pages - including the controls that only appear in some
 states (the resolution slider, which Boost reveals; the monitor and card
 pickers, which need more than one of each).
 
-Run:  runtime\\python.exe tests\\test_settings_hints.py
+Run:  python3 tests\\test_settings_hints.py
 """
 import os
 import sys

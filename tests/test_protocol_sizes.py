@@ -14,7 +14,7 @@ So this test needs no table of its own. It reads those asserts, looks up the
 named format in main.py, and demands the same number - which means the two
 sides can only drift if someone edits both files to disagree on purpose.
 
-Run:  runtime\\python.exe tests\\test_protocol_sizes.py
+Run:  python3 tests\\test_protocol_sizes.py
 """
 import re
 import struct

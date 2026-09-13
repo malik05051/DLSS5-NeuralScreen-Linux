@@ -1,15 +1,44 @@
 """ScreenCapture - desktop capture for the DLSS 5 NR prototype (desktop-nr).
 
-Backend: DXCamera (Windows Desktop Duplication API, DXGI).
-Frames come back as np.ndarray shape (H, W, 4) dtype uint8 in RGBA (dxcam
-does the BGRA conversion itself, into a reusable buffer).
+Backend: xdg-desktop-portal ScreenCast, read as a PipeWire stream.
+Frames come back as np.ndarray shape (H, W, 4) dtype uint8 in RGBA.
 
-Monitor identity: monitors are matched by their DXGI DeviceName
-('\\\\.\\DISPLAY1'), not by a positional index. list_monitors() pairs each
-EnumDisplayMonitors entry with the dxcam output whose devicename matches, so
-the returned index is the dxcam output_idx for THAT monitor. A saved
-devicename therefore keeps pointing at the same physical monitor when the
-arrangement changes (cable unplug, display reorder, laptop dock).
+This is the module that changed most in the move off Windows, and the change
+is not a swap of one API for another. Desktop Duplication was something a
+program did to a monitor: open it, pull frames, no one asked. A Wayland
+compositor does not let a client read another client's pixels at all, so the
+capture is something the *user* grants, once, through a picker - and what
+comes back is not a monitor but a PipeWire node that happens to carry one.
+
+Three consequences the rest of the program has to know about:
+
+  * **The first launch shows a dialog.** It cannot be avoided and should not
+    be worked around. It can be avoided on every launch *after* the first:
+    the portal hands back a `restore_token`, that token goes into the config,
+    and a session opened with it restores the same screen silently. The
+    Windows build stored a DXGI devicename for the same reason - to survive
+    a reorder - and this is the same idea with the compositor's agreement.
+
+  * **Monitor identity is the connector name** - "DP-1", "HDMI-A-2",
+    "eDP-1" - not '\\\\.\\DISPLAY1'. It is better in the way that matters:
+    it names the physical socket, so unplugging a second monitor and
+    plugging it back in somewhere else keeps the name. `list_monitors()`
+    returns it where the Windows version returned the DXGI name, and the
+    saved config is compatible in shape though not in content, so a config
+    carried over from Windows falls back to the picker once.
+
+  * **There is no equivalent of "capture the whole virtual desktop".** The
+    portal grants one source. That is not a limitation in practice - the
+    program has always processed one monitor - but `monitor_origin()` now
+    answers from the compositor's logical coordinate space rather than the
+    virtual-desktop space Windows built out of monitor rectangles.
+
+Frames on the Python side come through GStreamer's `pipewiresrc`, which is
+the one PipeWire consumer that is both universally installed and has a
+Python binding. It is only used when `capture_in_worker` is off: the normal
+path is the worker importing the stream's dmabuf straight into Vulkan, which
+never copies a pixel through Python at all - the same division of labour the
+Windows build had between dxcam and the worker's own DDA.
 
 Example:
     cap = ScreenCapture(monitor_idx=0)
@@ -19,98 +48,93 @@ Example:
 
 from __future__ import annotations
 
-import ctypes
+import os
 import sys
-from ctypes import wintypes
+import threading
+import time
 
 import numpy as np
 
-
-class _MONITORINFOEXW(ctypes.Structure):
-    """MONITORINFOEXW: the monitor rect plus the szDevice name."""
-
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("rcMonitor", wintypes.RECT),
-        ("rcWork", wintypes.RECT),
-        ("dwFlags", wintypes.DWORD),
-        ("szDevice", wintypes.WCHAR * 32),
-    ]
+import portal
+from wayland_shell import SHELL
 
 
-def _dxcam_output_index_by_devicename() -> dict[str, int]:
-    """Map each DXGI devicename to its dxcam output_idx.
+#: The token that lets the next launch skip the picker. Owned by the config;
+#: this module only reads and updates it, see `restore_token()`.
+_RESTORE_TOKEN = ""
 
-    dxcam.create(output_idx=N) indexes the outputs of the primary adapter
-    (device_idx=0); the factory's outputs list is [adapter][output], and the
-    index of an Output inside its adapter's list IS the output_idx. Reading
-    the factory's Output objects is cheap (GetDesc only) - no DDA session is
-    opened, unlike dxcam.create().
+#: The outputs, cached. Enumerating means a Wayland roundtrip; the menu asks
+#: on every frame it is open and two roundtrips per frame cost more than the
+#: network does. Monitors are not hot-plugged often, and when they are the
+#: compositor tells us and `refresh_outputs()` is called.
+_OUTPUTS: list | None = None
+_OUTPUTS_LOCK = threading.Lock()
+
+
+def _ensure_shell() -> bool:
+    """Make sure the Wayland connection is up. False on a machine with none."""
+    if SHELL.display is not None:
+        return True
+    return SHELL.connect()
+
+
+def refresh_outputs() -> None:
+    """Forget the cached output list.
+
+    The counterpart of the Windows build's `_refresh_dxcam_factory`: called
+    when a monitor was unplugged or the arrangement changed and the cached
+    indices are stale.
     """
-    import dxcam
+    global _OUTPUTS
+    with _OUTPUTS_LOCK:
+        _OUTPUTS = None
+    if SHELL.display is not None:
+        try:
+            SHELL.display.roundtrip()
+        except Exception:
+            pass
 
-    mapping: dict[str, int] = {}
-    for outputs in dxcam.__factory.outputs:
-        for idx, output in enumerate(outputs):
-            mapping.setdefault(output.devicename, idx)
-    return mapping
+
+#: Kept under its Windows name so the call sites that mean "re-enumerate"
+#: still say so. There is no dxcam and no factory; there is a compositor
+#: that was asked again.
+_refresh_dxcam_factory = refresh_outputs
+
+
+def _outputs() -> list:
+    global _OUTPUTS
+    with _OUTPUTS_LOCK:
+        if _OUTPUTS is not None:
+            return _OUTPUTS
+    if not _ensure_shell():
+        return []
+    found = SHELL.output_list()
+    with _OUTPUTS_LOCK:
+        _OUTPUTS = found
+    return found
 
 
 def _output_count() -> int:
-    """The number of outputs dxcam currently knows on the primary adapter.
-
-    0 means dxcam is unavailable or its factory failed - callers treat it
-    as "no valid index", never as output 0.
-    """
-    try:
-        import dxcam
-
-        return len(dxcam.__factory.outputs[0])
-    except Exception:
-        return 0
-
-
-def _refresh_dxcam_factory() -> None:
-    """Re-enumerate the DXGI adapters/outputs in the dxcam factory.
-
-    The factory is a process-wide Singleton built at the first import; a
-    monitor unplugged or a dock changed after that leaves a stale outputs
-    list, and dxcam.create(output_idx=N) then raises IndexError for an
-    index that was valid a minute ago (issue #24/#26: 'list index out of
-    range' on a monitor switch). Dropping the cached instance makes the
-    next access re-enumerate.
-    """
-    try:
-        import dxcam
-
-        dxcam.Singleton._instances.pop(dxcam.DXFactory, None)
-        dxcam.__factory = dxcam.DXFactory()
-    except Exception:
-        pass
+    return len(_outputs())
 
 
 def resolve_output_idx(devicename: str) -> int | None:
-    """The dxcam output_idx for a DXGI devicename ('\\\\.\\DISPLAY1'), or None.
-
-    None means the monitor is not present in the current DXGI output list
-    (unplugged, dock changed, driver reset).
-    """
-    return _dxcam_output_index_by_devicename().get(devicename)
+    """The index of the output with this connector name, or None when gone."""
+    for idx, out in enumerate(_outputs()):
+        if out.name == devicename:
+            return idx
+    return None
 
 
 def devicename_for_output_idx(output_idx: int) -> str | None:
-    """The DXGI devicename of the dxcam output at output_idx, or None.
+    """The connector name of the output at this index, or None.
 
     The inverse of resolve_output_idx - used when saving the config so the
     monitor is remembered by identity instead of by a positional index.
     """
-    try:
-        by_name = _dxcam_output_index_by_devicename()
-    except Exception:
-        return None
-    for devicename, idx in by_name.items():
-        if idx == output_idx:
-            return devicename
+    outputs = _outputs()
+    if 0 <= output_idx < len(outputs):
+        return outputs[output_idx].name or None
     return None
 
 
@@ -119,338 +143,350 @@ _ADAPTERS: list | None = None
 
 
 def list_adapters() -> list[tuple[int, str]]:
-    """NVIDIA cards as [(dxgi_index, name), ...], in EnumAdapters1 order.
+    """NVIDIA cards as [(index, name), ...], in NVML enumeration order.
 
     The index is what matters: it is what the worker's NS_GPU takes and what
     its "[host] adapter N: ..." lines print, so the menu and the log agree on
-    which card is which.
+    which card is which. On Linux that index is also what
+    CUDA_VISIBLE_DEVICES and Vulkan's physical-device order are keyed to,
+    which is one fewer translation than the DXGI adapter index needed.
 
-    Only NVIDIA, and never the software renderer: the network cannot run
-    anywhere else, and the capture has to sit on the same card as the network
-    (the frame reaches D3D12 through a shared handle, which does not cross
-    adapters). A machine with one card gets a one-item list, and the menu
-    hides the choice.
+    Only NVIDIA: the network cannot run anywhere else. A machine with one
+    card gets a one-item list, and the menu hides the choice.
 
     Enumerated once per process and kept: menu_payload runs on every frame
-    while the menu is open, and two DXGI enumerations per frame cost more
-    than the network does (measured: 29 -> 13.6 FPS). Cards are not
-    hot-plugged, and moving the worker to another one restarts it anyway.
+    while the menu is open. Cards are not hot-plugged, and moving the worker
+    to another one restarts it anyway.
     """
     global _ADAPTERS
     if _ADAPTERS is not None:
         return _ADAPTERS
-    try:
-        from dxcam.core.device import Device
-        from dxcam.util.io import enum_dxgi_adapters
-    except Exception:
-        return []
-    out: list[tuple[int, str]] = []
-    try:
-        for idx, adapter in enumerate(enum_dxgi_adapters()):
-            desc = Device(adapter).desc
-            # 0x10DE is NVIDIA; flag 2 is DXGI_ADAPTER_FLAG_SOFTWARE.
-            if desc.VendorId != 0x10DE or (getattr(desc, "Flags", 0) & 2):
-                continue
-            out.append((idx, str(desc.Description).strip()))
-    except Exception as exc:
-        print(f"[capture] could not enumerate the adapters: {exc}",
-              file=sys.stderr)
-        return []
+    import gpuinfo
+
+    out = gpuinfo.list_gpus()
     _ADAPTERS = out
     return out
 
 
-def _devicename_at(x: int, y: int) -> str:
-    """The device name of the monitor whose rectangle contains (x, y).
-
-    MONITOR_DEFAULTTONULL: a point on no monitor answers nothing rather
-    than the nearest guess - the caller wants the truth or silence.
-    """
-    try:
-        hmon = ctypes.windll.user32.MonitorFromPoint(
-            wintypes.POINT(int(x), int(y)), 0)   # 0 = MONITOR_DEFAULTTONULL
-        if not hmon:
-            return ""
-        info = _MONITORINFOEXW()
-        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
-        if not ctypes.windll.user32.GetMonitorInfoW(ctypes.c_void_p(hmon),
-                                                    ctypes.byref(info)):
-            return ""
-        return "".join(info.szDevice).rstrip("\x00")
-    except Exception:
-        return ""
-
-
 def monitor_origin(devicename: str) -> tuple[int, int] | None:
-    """The chosen monitor's top-left corner on the virtual desktop, or None.
+    """The chosen monitor's top-left corner in the compositor's coordinates.
 
-    Windows places every monitor on one virtual desktop whose origin is the
-    PRIMARY monitor's corner - a second monitor can sit at x=1920 or even
-    x=-1080. The overlay (pygame layer) and the worker's output window were
-    both created at (0,0) regardless of which monitor was chosen, so the
-    picture landed on the primary screen while the capture ran on the
-    chosen one (issues #28, #33).
+    Wayland places every output in one logical space, exactly as Windows put
+    every monitor on one virtual desktop, and for the same reason the
+    overlay has to know it: the layer surface and the frame both have to land
+    on the screen the capture is running on (issues #28, #33).
+
+    Answered from xdg_output's logical position, which is the space the
+    pointer and the portal's own stream metadata use. wl_output's raw
+    position is in physical pixels and disagrees the moment any monitor is
+    scaled.
     """
-    found: list[tuple[int, int]] = []
-
-    def _cb(hmon, _hdc, lprect, _lparam) -> bool:
-        info = _MONITORINFOEXW()
-        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
-        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
-            if "".join(info.szDevice).rstrip("\x00") == devicename:
-                r = lprect.contents
-                found.append((r.left, r.top))
-        return True
-
-    MONITORENUMPROC = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
-        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
-    ctypes.windll.user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(_cb), 0)
-    return found[0] if found else None
+    for out in _outputs():
+        if out.name == devicename:
+            return (out.x, out.y)
+    return None
 
 
 def monitor_size(devicename: str) -> tuple[int, int] | None:
-    """The CURRENT size of one monitor, by DXGI devicename, or None.
+    """The CURRENT size of one monitor, by connector name, or None.
 
-    Asked live, straight from EnumDisplayMonitors: st.capture.resolution is
-    what the monitor was when the capture session opened, and the desktop
-    resolution can change under a running pipeline (the user switching
-    1440p -> 4K, a game changing the mode, a dock). This is the cheap check
-    the loop can afford between frames; the dxcam factory is not consulted
-    because its cached outputs are exactly what goes stale.
+    Asked live: st.capture.resolution is what the monitor was when the
+    capture session opened, and the resolution can change under a running
+    pipeline (the user switching 1440p -> 4K, a game changing the mode, a
+    dock). A Wayland roundtrip is the cheap check the loop can afford
+    between frames.
     """
-    found: list[tuple[int, int]] = []
+    if not _ensure_shell():
+        return None
+    try:
+        SHELL.display.roundtrip()
+    except Exception:
+        return None
+    for out in SHELL.output_list():
+        if out.name == devicename:
+            return _physical_size(out)
+    return None
 
-    def _cb(hmon, _hdc, lprect, _lparam) -> bool:
-        info = _MONITORINFOEXW()
-        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
-        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
-            if "".join(info.szDevice).rstrip("\x00") == devicename:
-                r = lprect.contents
-                found.append((r.right - r.left, r.bottom - r.top))
-        return True
 
-    MONITORENUMPROC = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
-        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
-    ctypes.windll.user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(_cb), 0)
-    return found[0] if found else None
+def _physical_size(out) -> tuple[int, int]:
+    """The pixel size of an output, with rotation taken into account.
+
+    wl_output reports the mode, which is the panel's own orientation: a
+    monitor rotated 90 degrees still says 3840x2160 while the desktop on it
+    is 2160x3840. The capture produces the rotated picture, so the rotated
+    numbers are the ones every size downstream has to be built from. The
+    Windows build could not do this at all - 90 and 270 came out with the
+    sides swapped, and it is listed as a known limitation there.
+    """
+    w, h = out.width, out.height
+    if not w or not h:
+        w, h = out.logical_w * out.scale, out.logical_h * out.scale
+    if out.rotated:
+        w, h = h, w
+    return (int(w), int(h))
 
 
 def list_monitors() -> list[tuple[int, int, int, str]]:
     """Monitors as [(idx, w, h, devicename), ...].
 
-    idx is the dxcam output index matched BY devicename (DXGI DeviceName,
-    e.g. '\\\\.\\DISPLAY1'), not the EnumDisplayMonitors order - the two
-    orders can differ after a cable unplug or a display reorder. When a
-    monitor is not in the dxcam output list the positional index is used as
-    a fallback (the old behavior). DPI awareness must already be set in the
-    calling process, otherwise the sizes come back in scaled pixels.
+    idx is the position in the output list sorted by corner, which is stable
+    across a session and is what the menu shows. devicename is the connector
+    name, which is stable across everything and is what the config saves.
+    Sizes are physical pixels, rotation applied.
     """
-    monitors: list[tuple[int, int, int, str]] = []
+    out: list[tuple[int, int, int, str]] = []
+    for idx, output in enumerate(_outputs()):
+        w, h = _physical_size(output)
+        out.append((idx, w, h, output.name))
+    return out
 
-    def _cb(hmon, _hdc, lprect, _lparam) -> bool:
-        r = lprect.contents
-        info = _MONITORINFOEXW()
-        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
-        devicename = ""
-        if ctypes.windll.user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
-            devicename = "".join(info.szDevice).rstrip("\x00")
-        monitors.append((r.left, r.top, r.right - r.left, r.bottom - r.top,
-                         devicename))
-        return True
 
-    MONITORENUMPROC = ctypes.WINFUNCTYPE(
-        wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
-        ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
-    ctypes.windll.user32.EnumDisplayMonitors(0, 0, MONITORENUMPROC(_cb), 0)
+def monitor_label(devicename: str) -> str:
+    """A human name for a monitor: "DP-1 - Dell U2720Q", or just the name.
 
-    try:
-        by_name = _dxcam_output_index_by_devicename()
-    except Exception:
-        # dxcam unavailable or its factory failed - fall back to the
-        # positional order (the old behavior).
-        by_name = {}
-    return [
-        (by_name.get(devicename, i), w, h, devicename)
-        for i, (_x, _y, w, h, devicename) in enumerate(monitors)
-    ]
+    The menu had nothing to show but '\\\\.\\DISPLAY2' on Windows. The
+    compositor knows the make and model, so the menu can say which monitor
+    is which without the user counting sockets.
+    """
+    for out in _outputs():
+        if out.name == devicename:
+            return f"{out.name} - {out.description}" if out.description \
+                else out.name
+    return devicename
+
+
+# ---------------------------------------------------------------------------
+# The capture itself
+# ---------------------------------------------------------------------------
 
 
 class ScreenCapture:
-    """Monitor capture through DXCamera (Desktop Duplication API).
+    """Monitor capture through the portal, read with GStreamer's pipewiresrc.
 
-    On hybrid-graphics laptops (Optimus) the internal display is wired to
-    the iGPU and Windows refuses a cross-adapter DDA session
-    (DXGI_ERROR_UNSUPPORTED, 0x887A0004 - issue #26). When dxcam cannot
-    open at all, the capture falls back to mss (GDI BitBlt): slower, but
-    it works on any display wiring. The worker's own DDA path is
-    unaffected - this is the Python-side capture used when the worker
-    cannot capture either.
+    The Windows build kept a GDI fallback here for hybrid laptops where
+    Desktop Duplication refused a cross-adapter session. That whole class of
+    failure is gone: the compositor composites the frame whatever GPU it
+    happens to live on, and a PipeWire buffer that cannot be imported
+    directly is delivered as memory instead. What replaces the fallback is
+    a format negotiation, and the one thing it can still fail at - no
+    GStreamer - is reported plainly rather than limped past, because the
+    worker's own capture path is the normal one and this is the fallback.
     """
 
-    def __init__(self, monitor_idx: int = 0, devicename: str | None = None):
-        import dxcam
+    def __init__(self, monitor_idx: int = 0, devicename: str | None = None,
+                 restore_token: str = ""):
+        self.monitor_idx = monitor_idx
+        self.devicename = devicename or ""
+        self.resolution = (0, 0)
+        self.restore_token = restore_token or _RESTORE_TOKEN
+        self._session = None
+        self._pipeline = None
+        self._sink = None
+        self._frame: np.ndarray | None = None
+        self._frame_lock = threading.Lock()
+        self._error = ""
 
-        self._dxcam = dxcam
-        self._mss = None  # the GDI fallback session, when dxcam is unusable
         if devicename is not None:
-            # Resolve by identity: the devicename is the stable handle, the
-            # output index is whatever dxcam assigns today.
             resolved = resolve_output_idx(devicename)
             if resolved is None:
-                raise ValueError(
-                    f"no dxcam output matches devicename {devicename!r}")
-            monitor_idx = resolved
-        # The dxcam factory caches the output list at the first import; a
-        # monitor unplugged or a dock changed since then leaves stale
-        # indices, and dxcam.create() raises IndexError for them (issue
-        # #24/#26). Validate, refresh the factory once, then fall back to
-        # output 0 - the capture must never take the app down.
-        if monitor_idx >= _output_count():
-            print(f"[capture] output {monitor_idx} is gone - "
-                  "re-enumerating the dxcam factory", file=sys.stderr)
-            _refresh_dxcam_factory()
-            if monitor_idx >= _output_count():
-                print(f"[capture] output {monitor_idx} still missing - "
-                      "falling back to output 0", file=sys.stderr)
+                # Not fatal, unlike the Windows build's ValueError: the
+                # portal is about to ask the user anyway, and a monitor that
+                # was unplugged since the config was written is exactly the
+                # case the picker exists for.
+                print(f"[capture] no output is called {devicename!r} any more "
+                      "- the portal will ask which screen to use",
+                      file=sys.stderr)
+                self.restore_token = ""
+            else:
+                monitor_idx = resolved
+        outputs = _outputs()
+        if outputs and monitor_idx >= len(outputs):
+            print(f"[capture] output {monitor_idx} is gone - re-enumerating",
+                  file=sys.stderr)
+            refresh_outputs()
+            outputs = _outputs()
+            if monitor_idx >= len(outputs):
+                print("[capture] falling back to output 0", file=sys.stderr)
                 monitor_idx = 0
         self.monitor_idx = monitor_idx
-        # output_color="RGBA": dxcam converts BGRA->RGBA into its own reusable
-        # buffer. This used to be a cv2.cvtColor right here — an extra 33 MB
-        # allocated for every 4K frame.
-        try:
-            self._camera = dxcam.create(
-                output_idx=monitor_idx,
-                output_color="RGBA",
-            )
-        except IndexError:
-            # The factory was fresh a moment ago but the topology changed
-            # between the check and the create - one more refresh, then the
-            # primary output as the last resort.
-            print(f"[capture] dxcam.create({monitor_idx}) raised IndexError - "
-                  "re-enumerating and retrying", file=sys.stderr)
-            _refresh_dxcam_factory()
-            try:
-                self._camera = dxcam.create(
-                    output_idx=monitor_idx,
-                    output_color="RGBA",
-                )
-            except IndexError:
-                print("[capture] the chosen output is gone - "
-                      "falling back to output 0", file=sys.stderr)
-                self.monitor_idx = 0
-                self._camera = dxcam.create(
-                    output_idx=0,
-                    output_color="RGBA",
-                )
-        except Exception as exc:
-            # DXGI_ERROR_UNSUPPORTED on hybrid graphics (issue #26): the
-            # display is wired to the iGPU and DDA refuses a cross-adapter
-            # session. mss (GDI) captures any display - slower, but it
-            # works. The worker's own DDA path is tried separately and
-            # falls back to Python-side frames the same way.
-            print(f"[capture] dxcam unavailable ({exc}) - "
-                  "falling back to mss (GDI)", file=sys.stderr)
-            self._camera = None
-        if self._camera is None:
-            self._open_mss(monitor_idx)
+        if outputs:
+            self.devicename = outputs[min(monitor_idx, len(outputs) - 1)].name
+            self.resolution = _physical_size(outputs[min(monitor_idx,
+                                                         len(outputs) - 1)])
+        self._open()
+
+    # -- negotiation -------------------------------------------------------
+
+    def _open(self, source_types: int = portal.SOURCE_MONITOR) -> None:
+        global _RESTORE_TOKEN
+        self._session = portal.open_screencast(source_types=source_types,
+                                               restore_token=self.restore_token)
+        if not self._session.ok:
+            self._error = "the portal did not grant a capture"
             return
-        # The monitor identity of the output that was actually opened.
-        output = getattr(self._camera, "_output", None)
-        self.devicename = getattr(output, "devicename", None) or devicename or ""
-        # Monitor resolution (W, H) from the output description
-        res = getattr(output, "resolution", None)
-        if res is not None:
-            self.resolution = (int(res[0]), int(res[1]))
-        else:
-            # Fallback: the first frame
-            probe = self._camera.grab()
-            if probe is None:
-                raise RuntimeError(
-                    "could not grab a first frame to determine the resolution")
-            self.resolution = (probe.shape[1], probe.shape[0])
+        if self._session.restore_token:
+            self.restore_token = self._session.restore_token
+            _RESTORE_TOKEN = self.restore_token
+        if self._session.size != (0, 0):
+            self.resolution = self._session.size
+        self._start_gstreamer()
 
-    def _open_mss(self, monitor_idx: int) -> None:
-        """Open the GDI fallback (mss) for the given monitor index."""
-        import mss
+    @property
+    def node_id(self) -> int:
+        """The PipeWire node the worker should open. -1 when there is none."""
+        return self._session.node_id if self._session is not None else -1
 
-        # mss 10 deprecated the lowercase factory ("will be removed in a
-        # future release"); the bundled runtime already warns about it. Use
-        # the new name where it exists so a runtime bump does not take the
-        # fallback down with it.
-        self._mss = (mss.MSS if hasattr(mss, "MSS") else mss.mss)()
-        # mss.monitors[0] is the virtual all-in-one screen; the physical
-        # monitors start at index 1 (the stas2192 pattern, issue #26).
-        real_idx = monitor_idx + 1
-        if real_idx >= len(self._mss.monitors):
-            real_idx = 1 if len(self._mss.monitors) > 1 else 0
-        self._monitor = self._mss.monitors[real_idx]
-        self.resolution = (int(self._monitor["width"]),
-                           int(self._monitor["height"]))
-        # The identity of the monitor that was ACTUALLY opened, asked of
-        # Windows by the corner mss reported. It used to be synthesised from
-        # the index - "\\.\DISPLAY{idx+1}" - and DXGI output order and
-        # DISPLAYn numbering are not guaranteed to agree (this module's own
-        # docstring says so). On a machine where they disagree the guess
-        # named ANOTHER monitor, and the overlay origin, NS_OUTPUT and the
-        # identity saved to the config all followed the guess while the
-        # capture itself was on the right screen (audit).
-        #
-        # No answer means no answer: an empty name makes _apply_monitor_env
-        # keep output 0 and the primary corner, and say so in the log. That
-        # is the old behaviour, arrived at honestly instead of by a guess
-        # that looks like knowledge.
-        self.devicename = _devicename_at(int(self._monitor.get("left", 0)),
-                                         int(self._monitor.get("top", 0))) or ""
-        print(f"[capture] mss (GDI) capture active: {self.resolution} "
-              f"on {self.devicename or 'an unknown monitor'}", file=sys.stderr)
+    @property
+    def pipewire_fd(self) -> int:
+        """The PipeWire remote fd, for handing to the worker. -1 when none."""
+        return self._session.fd if self._session is not None else -1
+
+    @property
+    def error(self) -> str:
+        return self._error
+
+    # -- the GStreamer side ------------------------------------------------
+
+    def _start_gstreamer(self) -> None:
+        """Build pipewiresrc ! videoconvert ! appsink, and run it.
+
+        `videoconvert` rather than demanding RGBA from the source: what the
+        compositor offers depends on the compositor and the GPU (BGRx is the
+        common one, and on some setups only a dmabuf format is offered at
+        all). Converting costs a copy on the fallback path, and the fallback
+        path is the one that was already copying through Python.
+        """
+        try:
+            import gi
+            gi.require_version("Gst", "1.0")
+            gi.require_version("GstApp", "1.0")
+            from gi.repository import Gst, GstApp     # noqa: F401
+        except Exception as exc:
+            self._error = (
+                "GStreamer with the PipeWire plugin is needed to read frames "
+                f"in Python ({exc}). The worker's own capture does not need "
+                "it - leave \"capture_in_worker\" on.")
+            print(f"[capture] {self._error}", file=sys.stderr)
+            return
+        from gi.repository import Gst
+
+        if not Gst.is_initialized():
+            Gst.init(None)
+        # The fd belongs to the session and is closed with it; GStreamer
+        # duplicates it rather than taking ownership.
+        description = (
+            f"pipewiresrc fd={self._session.fd} path={self._session.node_id} "
+            "always-copy=true ! videoconvert ! "
+            "video/x-raw,format=RGBA ! "
+            "appsink name=ns emit-signals=true max-buffers=1 drop=true sync=false")
+        try:
+            self._pipeline = Gst.parse_launch(description)
+            self._sink = self._pipeline.get_by_name("ns")
+            self._sink.connect("new-sample", self._on_sample)
+            self._pipeline.set_state(Gst.State.PLAYING)
+        except Exception as exc:
+            self._error = f"the GStreamer pipeline would not start: {exc}"
+            print(f"[capture] {self._error}", file=sys.stderr)
+            self._pipeline = None
+
+    def _on_sample(self, sink):
+        from gi.repository import Gst
+
+        sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        caps = sample.get_caps().get_structure(0)
+        width = caps.get_value("width")
+        height = caps.get_value("height")
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            # A copy, and it has to be: the mapping is unmapped the moment
+            # this returns and grab() hands the array to a pipeline that
+            # holds it for a frame or two.
+            frame = np.frombuffer(info.data, dtype=np.uint8,
+                                  count=width * height * 4).reshape(
+                                      height, width, 4).copy()
+        finally:
+            buf.unmap(info)
+        with self._frame_lock:
+            self._frame = frame
+            self.resolution = (width, height)
+        return Gst.FlowReturn.OK
+
+    # -- the same surface the Windows version had --------------------------
 
     @classmethod
     def resolve_monitor(cls, devicename: str) -> int | None:
-        """The dxcam output_idx for a devicename, or None when it is gone."""
+        """The output index for a connector name, or None when it is gone."""
         return resolve_output_idx(devicename)
 
-    def grab(self) -> np.ndarray:
+    def grab(self) -> np.ndarray | None:
         """Grab the monitor's current frame.
 
         Returns:
             np.ndarray shape (H, W, 4) dtype uint8, RGBA channels,
             C-contiguous (frombuffer/tobytes without a copy).
-            May return None when the frame is not ready yet (rare).
+            None when no frame has arrived yet - which, exactly like
+            DXGI_ERROR_WAIT_TIMEOUT on the duplication path, means the screen
+            has not changed, not that anything is wrong.
 
-        Every grab() hands back a separate array: neighbouring frames do not
-        share memory (checked — _work/test_capture_rgba.py), so a frame can be
-        held across a loop iteration.
+        Every grab() hands back a separate array: the appsink copies each
+        buffer out of its mapping, so a frame can be held across a loop
+        iteration.
         """
-        if self._camera is not None:
-            return self._camera.grab()
-        # The mss (GDI) fallback: BGRA -> RGBA in one indexed copy (the raw
-        # buffer belongs to mss and is reused). GDI leaves the alpha byte at
-        # 0; the pipeline treats the frame as opaque RGBA8, so alpha is
-        # forced to 255 rather than left as a trap for whatever reads it
-        # next (a screenshot encoder, a texture upload).
-        raw = self._mss.grab(self._monitor)
-        img = np.frombuffer(raw.raw, dtype=np.uint8).reshape(
-            (raw.height, raw.width, 4))
-        rgba = img[:, :, [2, 1, 0, 3]]      # one copy, channels in place
-        rgba[:, :, 3] = 255
-        return rgba
+        with self._frame_lock:
+            frame, self._frame = self._frame, None
+        return frame
 
     def close(self) -> None:
-        """Release the capture resources."""
-        if self._camera is not None:
-            self._camera.release()
-            self._camera = None
-        if self._mss is not None:
+        """Release the capture resources.
+
+        Order matters: the GStreamer pipeline holds a duplicate of the
+        PipeWire fd and must be stopped before the portal session that owns
+        the original is closed, or the compositor keeps composing frames for
+        a stream nobody is reading.
+        """
+        if self._pipeline is not None:
             try:
-                self._mss.close()
+                from gi.repository import Gst
+                self._pipeline.set_state(Gst.State.NULL)
             except Exception:
                 pass
-            self._mss = None
+            self._pipeline = None
+            self._sink = None
+        if self._session is not None:
+            self._session.close()
+            self._session = None
 
     def __enter__(self) -> "ScreenCapture":
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+def restore_token() -> str:
+    """The token the config should remember so the next launch is silent."""
+    return _RESTORE_TOKEN
+
+
+def set_restore_token(token: str) -> None:
+    global _RESTORE_TOKEN
+    _RESTORE_TOKEN = token or ""
+
+
+def capture_window(restore_token: str = "") -> "portal.ScreenCastSession":
+    """Ask the user to pick a window, and return the granted session.
+
+    This is what Num5 became. On Windows the program found the window under
+    the cursor itself and started a Windows Graphics Capture on it; here a
+    client cannot enumerate other clients' windows, let alone point at one,
+    so the compositor's own picker does the choosing. It is one extra click
+    the first time and none afterwards - the restore token covers a window
+    the same way it covers a monitor.
+    """
+    return portal.open_screencast(source_types=portal.SOURCE_WINDOW,
+                                  restore_token=restore_token)

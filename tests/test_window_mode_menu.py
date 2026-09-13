@@ -33,6 +33,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ (autocheck)
 
 import autocheck  # noqa: E402
 
+from _needs import needs_wayland  # noqa: E402
+
 # Physical pixels, before pygame loads: SDL freezes the process DPI awareness
 # at import, and a window measured in logical units would not match what the
 # capture produces (960x540 logical = 1200x675 physical at 125%).
@@ -85,6 +87,8 @@ def grab_region(cam, rect):
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     busy = autocheck.running_instances()
     if busy:
         print(f"FAIL: NeuralScreen is already running ({busy}) - stop it first")

@@ -15,7 +15,7 @@ does not.
 Expected: a 0xBAD00001 line survives >40 subsequent diagnostics.
 [audit cpp-worker]
 
-Run:  runtime\\python.exe tests\\test_hard_failure_window.py
+Run:  python3 tests\\test_hard_failure_window.py
 """
 import sys
 from pathlib import Path

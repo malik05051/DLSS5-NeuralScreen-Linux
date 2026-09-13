@@ -5,10 +5,10 @@ time, and that is how a regression shipped: audit #3 broke the shared-memory
 pixel channel, `test_out_shm.py` caught it, and nobody ran `test_out_shm.py`.
 One command, one verdict, a non-zero exit on any failure.
 
-    runtime\\python.exe run_tests.py            static + tests + smoke
-    runtime\\python.exe run_tests.py --gui      ... and the full GUI cycle
-    runtime\\python.exe run_tests.py --only out_shm      one test by name
-    runtime\\python.exe run_tests.py --no-smoke          skip the smoke test
+    python3 run_tests.py            static + tests + smoke
+    python3 run_tests.py --gui      ... and the full GUI cycle
+    python3 run_tests.py --only out_shm      one test by name
+    python3 run_tests.py --no-smoke          skip the smoke test
 
 Two of the stages take over the screen for a few seconds each (the overlay is
 raised for real) and the machine should be left alone while they run. Nothing
@@ -35,7 +35,7 @@ except Exception:
     pass
 
 ROOT = Path(__file__).resolve().parent.parent  # the project root (tests/ lives inside it)
-PY = ROOT / "runtime" / "python.exe"
+PY = Path(sys.executable)
 TIMEOUT = 600
 # How long to wait for the previous test's processes to die before
 # starting the next one. See settle().
@@ -155,10 +155,13 @@ def settle(limit: float = SETTLE_LIMIT) -> float:
     """
     started = time.monotonic()
     while time.monotonic() - started < limit:
-        out = subprocess.run(["tasklist"], capture_output=True).stdout
-        text = out.decode("cp1251", errors="replace")
+        # ps rather than tasklist: the same question - what is still
+        # running - asked of the system that has the answer here.
+        out = subprocess.run(["ps", "-eo", "comm="],
+                             capture_output=True).stdout
+        text = out.decode("utf-8", errors="replace")
         if not [l for l in text.splitlines()
-                if "pythonw.exe" in l or "nvngx.dll" in l]:
+                if "neuralscreen-host" in l]:
             break
         time.sleep(0.25)
     return time.monotonic() - started

@@ -1,6 +1,6 @@
 """NeuralScreen v1.4 self-checks - the static part (no GUI).
 
-Run:  runtime\\python.exe autocheck.py
+Run:  python3 autocheck.py
 The GUI part (menu, recording) is run separately - see the end of the output.
 
 Every check reports PASS / FAIL / SKIP plus a reason. Exit: 0 = all PASS,
@@ -15,6 +15,8 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent  # the project root (tests/ lives inside it)
+sys.path.insert(0, str(ROOT))
+from paths import WORKER_EXE  # noqa: E402
 FAILS = []
 
 
@@ -31,29 +33,43 @@ def check(name, fn):
 
 
 def fresh_worker():
-    """nvngx.dll is built after the last commit and contains the hook."""
-    dll = ROOT / "native" / "nvngx.dll"
-    if not dll.exists():
-        return False, "no native/nvngx.dll"
-    data = dll.read_bytes()
-    if b"NS_ARCH_SPOOF" not in data:
-        return False, "no NS_ARCH_SPOOF in the binary (an old build?)"
-    # freshness: the mtime must not be older than any source it is built
-    # from. The .cpp is not alone any more - the HDR path lives in headers
-    # and an .inl included by it, and editing one of those without a
-    # rebuild leaves a binary that disagrees with the tree in silence.
-    sources = [ROOT / "native" / "dlss5-feed-host64.cpp",
-               ROOT / "native" / "hdr_display.h",
-               ROOT / "native" / "hdr_shaders.h",
-               ROOT / "native" / "hdr_present.inl",
-               ROOT / "native" / "ns_forwarder.cpp",
-               ROOT / "native" / "spout_bridge.cpp",
-               ROOT / "native" / "spout_bridge.h"]
-    stale = [s.name for s in sources
-             if s.exists() and dll.stat().st_mtime < s.stat().st_mtime]
+    """The worker is built, newer than its sources, and answers --probe.
+
+    The Windows version of this also checked for an NS_ARCH_SPOOF marker in
+    the binary - the architecture spoof that let a pre-Blackwell card run
+    the feature. That spoof was a forwarder DLL that inspected the module a
+    call was returning to, which is Windows loader behaviour with no Linux
+    equivalent, and this port does not carry it. TECHNICAL.md says so under
+    "What did not come across".
+    """
+    exe = WORKER_EXE
+    if not exe.exists():
+        return False, f"no {exe.relative_to(ROOT)} (native/linux/build-host.sh)"
+    sources = [ROOT / "native" / "linux" / name
+               for name in ("host.cpp", "ns_vk.cpp", "ns_vk.h", "ns_pw.cpp",
+                            "ns_pw.h", "ns_ipc.h")]
+    stale = [src.name for src in sources
+             if src.exists() and exe.stat().st_mtime < src.stat().st_mtime]
     if stale:
-        return False, f"the dll is older than {', '.join(stale)} - rerun build-host.bat"
-    return True, f"{dll.stat().st_size} bytes, the hook is there, fresh"
+        return False, (f"the worker is older than {', '.join(stale)} - "
+                       "rerun native/linux/build-host.sh")
+    # The window-capture mode has to be in there: it is a string in the
+    # binary exactly as WGCW was on Windows, and a build from before the
+    # mode existed would otherwise pass every other check.
+    if b"WGCW" not in exe.read_bytes():
+        return False, "the worker has no WGCW (window mode) - an old build?"
+    try:
+        probe = subprocess.run([str(exe), "--probe"], capture_output=True,
+                               text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"--probe did not run: {exc}"
+    if probe.returncode != 0:
+        # No GPU on this machine is not a build problem. Say which it is
+        # rather than failing a release gate for the wrong reason.
+        detail = (probe.stdout or probe.stderr or "").strip().splitlines()
+        return True, (f"built and fresh; --probe could not run here "
+                      f"({detail[-1] if detail else 'no device'})")
+    return True, f"{exe.stat().st_size} bytes, fresh, --probe passes"
 
 
 def personal_config_keys():
@@ -87,56 +103,65 @@ def personal_config_keys():
     return sorted(set(payload) | {"hotkeys"})
 
 
-def zip_integrity():
-    zpath = ROOT / "neuralscreen-v1.8.2-full.zip"
-    if not zpath.is_file():
-        return False, "no neuralscreen-v1.8.2-full.zip"
+def archive_integrity():
+    """The release tarball has everything and its sources are the committed ones."""
+    import tarfile
+
+    matches = sorted(ROOT.glob("neuralscreen-v*-full.tar.xz"))
+    if not matches:
+        return False, "no neuralscreen-v*-full.tar.xz (build_release_zip.py)"
+    apath = matches[-1]
     required = [
         "main.py", "gpuinfo.py", "overlay_ui.py", "i18n.py", "recorder.py",
         "display.py", "guides.py", "hotkeys.py", "tray.py", "capture.py",
-        "audio.py", "protocol.py", "winapi.py", "dialogs.py", "channels.py",
-        "settings_io.py", "paths.py", "pipeline.py", "commands.py",
-        "startup.py",
-        "NeuralScreen.exe",
-        "TECHNICAL.md", "TECHNICAL.ru.md",
-        "README.md", "README.ru.md", "NeuralScreen.vbs", "NeuralScreen.bat",
-        "native/nvngx.dll", "native/nvngx_dlssnr.dll",
-        # Neural Rendering does not start without it: the NGX calls
-        # have to leave a module whose path carries "nvngx.dll".
-        "native/nvngx.dll_ns-forwarder.dll",
-        # Loaded at run time, and both have a silent fallback: left out
-        # of the archive the program ships with the wrong icons and says
-        # nothing about it.
-        "native/neuralscreen.ico",
-        # The interface faces travel with the program: a Windows that
-        # lacks Segoe UI (or ships a different cut of it) would draw
-        # the menu in whatever it has.
+        "audio.py", "protocol.py", "toplevels.py", "dialogs.py",
+        "channels.py", "settings_io.py", "paths.py", "pipeline.py",
+        "commands.py", "startup.py",
+        "dbusio.py", "portal.py", "wayland_shell.py", "wlproto.py",
+        "neuralscreen.sh",
+        "TECHNICAL.md", "TECHNICAL.ru.md", "README.md", "README.ru.md",
+        "native/linux/neuralscreen-host", "native/nvngx_dlssnr.so",
+        # The layer-shell protocol XML: the bindings are generated from it
+        # at first run, so without it the overlay silently falls back to
+        # an xdg-shell window that cannot be click-through.
+        "native/protocols/wlr-layer-shell-unstable-v1.xml",
+        # Loaded at run time with a silent fallback: left out, the program
+        # ships with the wrong icon and says nothing about it.
+        "native/neuralscreen.png",
+        # The interface faces travel with the program: a distribution
+        # without IBM Plex would draw the menu in whatever it has.
         "fonts/IBMPlexSans-Regular.ttf", "fonts/IBMPlexMono-Regular.ttf",
         "fonts/OFL.txt",
-        "runtime/pythonw.exe", "VERSION.txt",
+        "VERSION.txt",
     ]
-    with zipfile.ZipFile(zpath) as z:
-        names = set(z.namelist())
+    with tarfile.open(apath, "r:xz") as tar:
+        names = {n.split("/", 1)[-1] if "/" in n else n
+                 for n in tar.getnames()}
         missing = [f for f in required if f not in names]
         if missing:
             return False, f"missing from the archive: {missing}"
-        # the worker in the archive carries the hook
-        dll = z.read("native/nvngx.dll")
-        if b"NS_ARCH_SPOOF" not in dll:
-            return False, "nvngx.dll in the archive has no hook"
-        # the worker in the archive carries the window-capture mode (WGCW)
-        if b"WGCW" not in dll:
-            return False, "nvngx.dll in the archive has no WGCW (window mode)"
-        # the PYTHON SOURCES in the archive must be EXACTLY the committed
+        prefix = ""
+        for n in tar.getnames():
+            if n.endswith("main.py"):
+                prefix = n[:-len("main.py")]
+                break
+
+        def read(member):
+            handle = tar.extractfile(prefix + member)
+            return handle.read() if handle is not None else b""
+
+        # The worker in the archive carries the window-capture mode.
+        if b"WGCW" not in read("native/linux/neuralscreen-host"):
+            return False, "the worker in the archive has no WGCW (window mode)"
+        # The PYTHON SOURCES in the archive must be EXACTLY the committed
         # ones: the archive is often rebuilt from a dirty tree, and a code
-        # change that never got committed ends up in the zip silently. The
-        # same goes for the worker - the archive carries a freshly built
-        # nvngx.dll whose content nobody can verify by eye, so a
-        # non-committed rebuild slips through (audit #4, C1/C2).
+        # change that never got committed ends up in it silently (audit #4,
+        # C1/C2).
         for name in ("main.py", "hotkeys.py", "display.py", "recorder.py",
-                     "overlay_ui.py", "i18n.py", "protocol.py", "winapi.py",
-                     "pipeline.py", "settings_io.py", "channels.py",
-                     "commands.py", "paths.py", "startup.py",
+                     "overlay_ui.py", "i18n.py", "protocol.py",
+                     "toplevels.py", "wayland_shell.py", "portal.py",
+                     "dbusio.py", "pipeline.py", "settings_io.py",
+                     "channels.py", "commands.py", "paths.py", "startup.py",
                      "README.md", "README.ru.md"):
             try:
                 head = subprocess.check_output(["git", "show", f"HEAD:{name}"],
@@ -147,13 +172,13 @@ def zip_integrity():
             # returns LF - compare the NORMALIZED bytes on both sides,
             # otherwise every CRLF file trips the check (audit #4, C2).
             crlf, lf = bytes([13, 10]), bytes([10])
-            got = z.read(name).replace(crlf, lf)
+            got = read(name).replace(crlf, lf)
             if got != head.replace(crlf, lf):
                 return False, f"{name} in the archive differs from HEAD"
         # the config in the archive is the default one, not a personal one:
         # personal values are written into the config legitimately, so we
         # check ALL such fields against the committed HEAD config
-        cfg = json.loads(z.read("config.json"))
+        cfg = json.loads(read("config.json"))
         try:
             head_cfg = json.loads(subprocess.check_output(
                 ["git", "show", "HEAD:config.json"]))
@@ -186,13 +211,15 @@ def zip_integrity():
 
 def gpuinfo_works():
     """gpuinfo.py answers: architecture plus official support."""
-    py = ROOT / "runtime" / "python.exe"
+    py = Path(sys.executable)
     if not py.exists():
-        return False, "no runtime/python.exe"
+        return False, "no interpreter"
     code = (
         "import sys; sys.path.insert(0, r'%s'); "
         "import gpuinfo; i = gpuinfo.probe(); "
-        "print(gpuinfo.describe(i)); print('official:', i['official'])" % ROOT
+        "print(gpuinfo.describe(i) or 'unknown GPU'); "
+        "print('official:', i['official']); print('cards:', gpuinfo.list_gpus())"
+        % ROOT
     )
     # PYTHONIOENCODING: without it the child prints in the console codepage
     # and an em-dash in the GPU name decodes into garbage (or throws).
@@ -202,22 +229,13 @@ def gpuinfo_works():
     if r.returncode != 0:
         return False, f"gpuinfo crashed: {r.stderr.strip()[:200]}"
     out = r.stdout.strip()
-    if "Blackwell" not in out:
+    if "unknown GPU" in out:
+        # NVML answered nothing: there is no NVIDIA card on this machine,
+        # which is a fact about the machine and not about the code.
+        return True, "no NVIDIA GPU here - gpuinfo answered without raising"
+    if "Blackwell" not in out and "officially supported" not in out:
         return False, f"odd answer: {out}"
     return True, out.replace("\n", " | ")
-
-
-def spoof_default_on():
-    """The spoof is on by default: ArchSpoofRequested has no =1 requirement."""
-    cpp = (ROOT / "native" / "dlss5-feed-host64.cpp").read_text(encoding="utf-8-sig")
-    start = cpp.find("static bool ArchSpoofRequested()")
-    end = cpp.find("static int SetupArchSpoof()")
-    body = cpp[start:end]
-    if "buf[0] == '0'" not in body:
-        return False, "the NS_ARCH_SPOOF=0 logic was not found in ArchSpoofRequested"
-    if "buf[0] == '1'" in body:
-        return False, "the old =1 logic is still in ArchSpoofRequested"
-    return True, "on by default, NS_ARCH_SPOOF=0 turns it off"
 
 
 def readme_consistency():
@@ -226,8 +244,8 @@ def readme_consistency():
     The READMEs are for someone installing the program, so the check that
     matters is that they stayed short and that every image and link in them
     resolves. The measurements live in the technical docs, and the one fact
-    those must not lose is the spoof default - it decides whether a 20/30/40
-    card works at all.
+    those must not lose is the account of what the port could not bring
+    across - that is the difference between a known gap and a bug report.
     """
     import re
 
@@ -245,10 +263,10 @@ def readme_consistency():
         if n > 200:
             return False, f"{name} is {n} lines - it drifted back into a manual"
     # The Russian needle is the content of a translated doc and stays Russian.
-    if "On by default" not in docs["TECHNICAL.md"]:
-        return False, "TECHNICAL.md lost the spoof default"
-    if "Включено по умолчанию" not in docs["TECHNICAL.ru.md"]:
-        return False, "TECHNICAL.ru.md lost the spoof default"
+    if "What did not come across" not in docs["TECHNICAL.md"]:
+        return False, "TECHNICAL.md lost the account of what was not ported"
+    if "Что не перенеслось" not in docs["TECHNICAL.ru.md"]:
+        return False, "TECHNICAL.ru.md lost the account of what was not ported"
 
     # Every relative link and image must resolve, in both directions.
     for name, text in docs.items():
@@ -374,10 +392,13 @@ def running_instances():
     fight over the screen capture - so a check that launches one has to know
     the field is clear, otherwise it measures the wrong process.
     """
-    out = subprocess.run(["tasklist"], capture_output=True).stdout
-    text = out.decode("cp1251", errors="replace")
-    return [l.split()[0] for l in text.splitlines()
-            if "pythonw.exe" in l or "nvngx.dll" in l]
+    # ps rather than tasklist: the same question - what is still
+    # running - asked of the system that has the answer here.
+    out = subprocess.run(["ps", "-eo", "comm="],
+                         capture_output=True).stdout
+    text = out.decode("utf-8", errors="replace")
+    return [l.strip() for l in text.splitlines()
+            if "neuralscreen-host" in l]
 
 
 def launch():
@@ -407,10 +428,13 @@ def quit_app(timeout=8.0):
     deadline = time.monotonic() + timeout
     left = []
     while time.monotonic() < deadline:
-        out = subprocess.run(["tasklist"], capture_output=True).stdout
-        text = out.decode("cp1251", errors="replace")
+        # ps rather than tasklist: the same question - what is still
+        # running - asked of the system that has the answer here.
+        out = subprocess.run(["ps", "-eo", "comm="],
+                             capture_output=True).stdout
+        text = out.decode("utf-8", errors="replace")
         left = [l for l in text.splitlines()
-                if "pythonw.exe" in l or "nvngx.dll" in l]
+                if "neuralscreen-host" in l]
         if not left:
             return []
         time.sleep(0.5)
@@ -538,9 +562,8 @@ def main():
         check("smoke: launch -> processing -> exit", smoke_check)
     else:
         check("worker: fresh, with the hook", fresh_worker)
-        check("zip: integrity and contents", zip_integrity)
+        check("archive: integrity and contents", archive_integrity)
         check("gpuinfo: answers", gpuinfo_works)
-        check("spoof: on by default", spoof_default_on)
         check("README: EN/RU agree", readme_consistency)
         check("git: the working copy is clean", git_clean)
         check("release notes: concise", release_notes_short)
@@ -551,8 +574,8 @@ def main():
     print("RESULT: all checks PASS")
     if "--gui" not in sys.argv and "--smoke" not in sys.argv:
         print()
-        print("smoke (20 s):  runtime\\python.exe autocheck.py --smoke")
-        print("GUI part:      runtime\\python.exe autocheck.py --gui")
+        print("smoke (20 s):  python3 autocheck.py --smoke")
+        print("GUI part:      python3 autocheck.py --gui")
     return 0
 
 

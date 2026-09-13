@@ -10,7 +10,7 @@ disproportionate, so the direct lookups get their own guard.
 Expected: every s["..."] key in overlay_ui.py exists in all 12 tables.
 [audit ui-display]
 
-Run:  runtime\\python.exe tests\\test_i18n_direct_keys.py
+Run:  python3 tests\\test_i18n_direct_keys.py
 """
 import re
 import sys

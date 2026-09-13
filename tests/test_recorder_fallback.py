@@ -31,6 +31,8 @@ sys.path.insert(0, str(BASE))  # the project modules (main.py, display.py, ...)
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ (autocheck)
 from recorder import VideoRecorder  # noqa: E402
 
+from _needs import needs_nvenc  # noqa: E402
+
 W, H = 640, 360
 FPS = 30.0
 FRAMES = 10
@@ -231,6 +233,8 @@ def test_close_does_not_deadlock_on_stuck_encoder(out: Path,
 
 
 def main() -> int:
+    if (skip := needs_nvenc()) is not None:
+        return skip
     failures: list = []
     out = Path(tempfile.gettempdir()) / "ns-test-fallback.mp4"
     out.unlink(missing_ok=True)

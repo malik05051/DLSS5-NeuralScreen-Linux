@@ -16,10 +16,12 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+# There is no process DPI awareness on Wayland - see main.py.
 import numpy as np
 import pygame
 import protocol as wire
+
+from _needs import needs_worker  # noqa: E402
 
 
 def exact(pipe, size):
