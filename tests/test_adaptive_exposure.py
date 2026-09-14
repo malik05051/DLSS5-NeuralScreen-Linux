@@ -21,12 +21,14 @@ import sys
 import time
 from pathlib import Path
 
+from _needs import needs_worker  # noqa: E402
+
 BASE = Path(__file__).resolve().parent.parent  # the project root
 sys.path.insert(0, str(BASE))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 LOG = BASE / "NeuralScreen.log"
-PY = BASE / "runtime" / "python.exe"
+PY = Path(sys.executable)
 
 
 def _smoothstep(t: float) -> float:
@@ -66,15 +68,17 @@ def _run_worker(env_extra: dict) -> str:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
-        # terminate() kills only python.exe - the worker (nvngx.dll) is a
+        # terminate() kills only the interpreter - the worker is a
         # child of main.py and survives, which makes the next GUI test fail
         # with "NeuralScreen is already running". Kill it by name.
-        subprocess.run(["taskkill", "/F", "/IM", "nvngx.dll"],
+        subprocess.run(["pkill", "-f", "neuralscreen-host"],
                        capture_output=True)
     return (pw_line or "") + "|" + (nr_line or "")
 
 
 def main() -> int:
+    if (skip := needs_worker()) is not None:
+        return skip
     failures = []
 
     # 1. Live: NS_PW=1 -> the [pw] line appears, NR comes up.

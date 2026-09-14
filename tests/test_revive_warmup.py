@@ -12,7 +12,7 @@ Expected: the warmup argument of every restart_worker call equals the
 one the launch used. This test reads the three call sites and compares
 their warmup arguments. [audit python-core F3]
 
-Run:  runtime\\python.exe tests\\test_revive_warmup.py
+Run:  python3 tests\\test_revive_warmup.py
 """
 import re
 import sys

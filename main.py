@@ -1,12 +1,12 @@
 """DLSS 5 Desktop NR - the integration skeleton of the prototype.
 
-The loop: desktop capture (capture.ScreenCapture) -> motion guides
-(guides.TemporalGuideGenerator) -> the NGX worker (native/nvngx.dll in
---live mode) -> fullscreen output (display.Display).
+The loop: desktop capture (the portal's PipeWire stream, read by the worker
+or by capture.ScreenCapture) -> motion guides (guides.TemporalGuideGenerator)
+-> the NGX worker (native/linux/neuralscreen-host in --live mode) -> the
+Wayland layer-shell overlay (display.Display).
 
-Controls (global hotkeys, RegisterHotKey + a polling fallback - see
-hotkeys.py). Num Lock must be on: the numpad sends Insert/End/arrows
-without it:
+Controls (global hotkeys, the GlobalShortcuts portal with an evdev fallback -
+see hotkeys.py):
     Num1          - NR on/off
     Num2          - the settings menu
     Num3          - screenshot
@@ -25,8 +25,6 @@ Run:
 from __future__ import annotations
 
 import argparse
-import ctypes
-from ctypes import wintypes
 import json
 import mmap
 import os
@@ -46,25 +44,21 @@ from pathlib import Path
 
 
 
-# DPI awareness BEFORE any import (cv2, capture, display, tray): if some
-# module sets awareness first (dxcam, for instance, calls
-# SetProcessDpiAwareness(2) when creating an Output), a second call returns
-# ERROR_ACCESS_DENIED and the pygame window ends up scaled (125% ->
-# 3072x1728). PER_MONITOR_AWARE_V2 = -4. Errors are ignored: display.py
-# repeats the call.
-try:
-    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-except Exception:
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
+# There is no DPI awareness to declare. On Windows this block had to run
+# before any other import, because a module that set the process awareness
+# first (dxcam did, when it created an Output) made every later call fail
+# with ERROR_ACCESS_DENIED and left the overlay scaled - a 125% display gave
+# a 3072x1728 window for a 3840x2160 screen.
+#
+# Wayland has no per-process scaling mode to be wrong about. A surface is
+# sized in its own buffer pixels and the compositor is told the scale; the
+# capture, the overlay and the worker all work in physical pixels, and
+# capture.py applies the output's scale and rotation once, where the
+# monitor's size is read.
 
-# Embedded Python (python313._pth) does not add cwd to sys.path - we add the
-# script folder by hand so the local modules work (capture, display, guides).
+# A bundled interpreter does not necessarily have the script folder on
+# sys.path - we add it by hand so the local modules work (capture, display,
+# guides).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import cv2
@@ -87,6 +81,7 @@ from taskbar import TaskbarWindow
 import dialogs
 import channels
 import commands
+import paths
 import startup
 import settings_io
 import pipeline
@@ -114,13 +109,14 @@ from settings_io import (  # noqa: F401
     WORK_SCALE_STEP, _next_preset_name, _set_autostart)
 from settings_io import (  # noqa: F401
     APP_VERSION, CHANNEL_LABEL, PROFILES, WORK_MAX_W, WORK_MAX_H, WORK_SCALE_MIN, _atomic_write_json, _autostart_enabled, _menu_layout_payload)
-# The Win32 window helpers live in winapi.py now. They are re-exported here
-# on purpose: main is where the rest of the program - and the tests - look
-# them up, and moving code must not move its callers.
-from winapi import (DWMWA_EXTENDED_FRAME_BOUNDS, _RECT,  # noqa: F401
-                    _is_desktop_window, _is_taskbar_window,
-                    foreign_foreground, list_capturable_windows,
-                    window_frame_rect, window_under_cursor)
+# The window helpers live in toplevels.py now - and are a good deal thinner
+# than winapi.py was, because most of what EnumWindows offered a Wayland
+# client cannot have. Re-exported here on purpose: main is where the rest of
+# the program - and the tests - look them up, and moving code must not move
+# its callers.
+from toplevels import (foreign_foreground, geometry_source,  # noqa: F401
+                       list_capturable_windows, window_frame_rect,
+                       window_title, window_under_cursor)
 
 # The worker protocol lives in protocol.py now - the magics, the formats, the
 # senders and the reader thread. Re-exported here because main is where the
@@ -315,19 +311,26 @@ def main() -> int:
     # instead of 56 closure variables.
     st = _Pipeline()
     parser = argparse.ArgumentParser(description="DLSS 5 Desktop NR prototype")
-    parser.add_argument("--config", type=Path, default=BASE_DIR / "config.json",
-                        help="path to config.json (defaults to next to main.py)")
+    parser.add_argument("--config", type=Path, default=paths.config_path(),
+                        help="path to config.json (next to main.py when there "
+                             "is one, otherwise ~/.config/neuralscreen)")
     args = parser.parse_args()
     _init_logging()  # pythonw: stdout/stderr -> NeuralScreen.log
 
-    # One instance only: two copies fight over the screen capture (the
-    # second one gets a dead DDA and the first one loses frames). The
-    # mutex is the standard Windows single-instance mechanism - it lives
-    # in the kernel and dies with the process, so a crashed copy does not
-    # block the next launch.
-    _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "NeuralScreen_SingleInstance")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-        print("[main] another NeuralScreen is already running - this copy exits", file=sys.stderr)
+    # One instance only: two copies fight over the screen, and the second
+    # one would put the user through the portal's picker for a capture it
+    # is not going to use. A named Windows mutex is not available; the
+    # equivalent with the same property - held by the kernel, released when
+    # the process dies however it dies - is an abstract-socket bind, which
+    # needs no file to clean up after a crash.
+    import socket as _socket
+
+    _instance = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        _instance.bind("\0neuralscreen-single-instance")
+    except OSError:
+        print("[main] another NeuralScreen is already running - this copy exits",
+              file=sys.stderr)
         return 1
 
     # The config file's path, kept in the state: the settings module writes
@@ -460,27 +463,14 @@ def main() -> int:
             # screen. While it is open we keep coming back up; a SetWindowPos
             # that changes nothing is cheap, and 30 frames is fast enough that
             # nobody sees the menu disappear.
-            if st.display.menu.visible and st.frame_index % 30 == 0:
-                st.display.raise_topmost()
-            # The same for the HUD even when the menu is closed: a borderless
-            # game (Cyberpunk) keeps itself on top and our HUD stays
-            # underneath it forever. Re-assert only when the topmost window
-            # is NOT ours - in the steady state this is zero SetWindowPos
-            # calls, so no DWM flicker (user: flicker + invisible HUD over
-            # borderless games).
-            if st.frame_index % 30 == 0:
-                try:
-                    top = ctypes.windll.user32.GetTopWindow(0)
-                    if top and top != st.display.get_hwnd():
-                        st.display.raise_topmost()
-                except Exception:
-                    pass
+            # The thirty-frame topmost re-assertion is gone, with the race
+            # it was losing. On Windows both our overlay and a borderless
+            # game asked to be topmost, and whichever asked last won, so the
+            # HUD disappeared under Cyberpunk until the next re-assert - and
+            # re-asserting every frame made the compositor flicker. A layer
+            # surface on the overlay layer is above every ordinary surface
+            # by protocol: there is nothing to win and nothing to poll.
             if st.window_hwnd is not None:
-                if not ctypes.windll.user32.IsWindow(ctypes.c_void_p(st.window_hwnd)):
-                    print("[main] the captured window closed - back to full screen",
-                          file=sys.stderr)
-                    pipeline.switch_window(st, 0)
-                    continue
                 pipeline.follow_window(st)
             elif st.frame_index % 30 == 0:
                 # Not in window mode: watch the monitor instead. Every
@@ -1004,12 +994,17 @@ if __name__ == "__main__":
         # keep the details in NeuralScreen.log.
         import traceback
         traceback.print_exc()
+        # Launched from a .desktop entry there is no console, so the reason
+        # goes to the desktop's own notifications - which is what a Linux
+        # user looks at, and what a message box was standing in for. The
+        # details stay in the log either way.
         try:
-            import ctypes as _ct
-            _ct.windll.user32.MessageBoxW(
-                None,
-                f"NeuralScreen failed to start: {exc}\n\nDetails in NeuralScreen.log next to the program.",
-                "NeuralScreen", 0x10)  # MB_ICONERROR
+            import subprocess as _sp
+
+            _sp.run(["notify-send", "--icon=neuralscreen", "--urgency=critical",
+                     "NeuralScreen failed to start",
+                     f"{exc}\n\nDetails in {startup.LOG_PATH}"],
+                    timeout=5, check=False)
         except Exception:
             pass
         sys.exit(1)

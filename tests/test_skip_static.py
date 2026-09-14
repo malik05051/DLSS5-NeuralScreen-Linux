@@ -24,7 +24,7 @@ Checked:
 * the flag off on the same static source: the old behavior, a full frame;
 * want_pixels on a static source with the flag on: the frame comes back.
 
-Run:  runtime\\python.exe tests\\test_skip_static.py
+Run:  python3 tests\\test_skip_static.py
 """
 import ctypes
 import os
@@ -37,6 +37,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+from _needs import needs_wayland  # noqa: E402
 
 BASE = Path(__file__).resolve().parent.parent  # the project root
 sys.path.insert(0, str(BASE))  # the project modules (main.py, display.py, ...)
@@ -118,6 +120,8 @@ def recv_result(worker):
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     if not WORKER_EXE.is_file():
         print(f"FAIL: worker not found: {WORKER_EXE}")
         return 1

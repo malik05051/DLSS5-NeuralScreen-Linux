@@ -11,7 +11,7 @@ screenshot_dir would ship silently.
 Expected: leak keys ⊇ the keys _menu_layout_payload can write.
 [audit ui-display]
 
-Run:  runtime\\python.exe tests\\test_leak_list.py
+Run:  python3 tests\\test_leak_list.py
 """
 import sys
 from pathlib import Path

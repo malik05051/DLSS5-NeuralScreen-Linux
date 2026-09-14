@@ -22,7 +22,7 @@ What this pins, without launching anything:
 * every language has all four strings, and every one of them FITS - a
   hint is clipped, not wrapped, and three of these labels are long.
 
-Run:  runtime\\python.exe tests\\test_hdr_switch.py
+Run:  python3 tests\\test_hdr_switch.py
 """
 import os
 import sys
@@ -38,6 +38,8 @@ import pipeline  # noqa: E402
 import settings_io  # noqa: E402
 import startup  # noqa: E402
 from i18n import STRINGS  # noqa: E402
+
+from _needs import needs_worker  # noqa: E402
 
 KEYS = ("hdr_mode", "hdr_mode_hint", "hdr_mode_on", "hdr_mode_off")
 
@@ -62,6 +64,8 @@ def _state(hdr=False):
 
 
 def main() -> int:
+    if (skip := needs_worker()) is not None:
+        return skip
     failures = []
 
     # 1. Off by default, on both roads out of the config.

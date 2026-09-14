@@ -41,6 +41,9 @@ raise SystemExit(main.main())
 '''
 
 
+from _needs import needs_wayland  # noqa: E402
+
+
 def _dpi_aware() -> None:
     try:
         ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
@@ -81,6 +84,8 @@ def _windows(title: str) -> list:
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     _dpi_aware()
     failures = []
 

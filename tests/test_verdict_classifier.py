@@ -22,7 +22,7 @@ So this pins three things:
 
 [audit: cpp-worker / python-core]
 
-Run:  runtime\\python.exe tests\\test_verdict_classifier.py
+Run:  python3 tests\\test_verdict_classifier.py
 """
 import re
 import sys

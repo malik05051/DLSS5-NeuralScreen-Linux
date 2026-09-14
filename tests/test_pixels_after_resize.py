@@ -20,7 +20,7 @@ The test is the one the audit asked for: a static target window, a real
 size change, then one WANT_PIXELS frame before anything repaints. The
 reply has to carry pixels.
 
-Run:  runtime\\python.exe tests\\test_pixels_after_resize.py
+Run:  python3 tests\\test_pixels_after_resize.py
 """
 import ctypes
 import struct
@@ -32,9 +32,11 @@ from pathlib import Path
 
 import numpy as np
 
+from _needs import needs_worker  # noqa: E402
+
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
-ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+# There is no process DPI awareness on Wayland - see main.py.
 
 import pygame  # noqa: E402
 import protocol as wire  # noqa: E402
@@ -88,6 +90,8 @@ def send_resize(proc, w, h, params):
 
 
 def main() -> int:
+    if (skip := needs_worker()) is not None:
+        return skip
     failures = []
     pygame.init()
     screen = pygame.display.set_mode((W, H), pygame.NOFRAME)

@@ -1,6 +1,6 @@
 # NeuralScreen
 
-**NVIDIA's DLSS 5 neural renderer, applied to your whole Windows desktop in
+**NVIDIA's DLSS 5 neural renderer, applied to your whole Wayland desktop in
 real time.** Everything on screen — games, video, photos — goes through the
 same neural network that DLSS 5 games use, and comes back sharper.
 
@@ -27,32 +27,45 @@ middle so you can see what the effect is actually doing.*
 
 ## What you need
 
-- **Windows 11**, or Windows 10 — reported working.
+- **A Wayland session.** This is a Wayland program; it will not start on X11.
+
+  | Compositor | Status |
+  |---|---|
+  | **Hyprland**, **sway**, **niri**, **Wayfire** | ✅ full overlay; window-follow works on Hyprland and sway |
+  | **KDE Plasma 6** | ✅ full overlay, tray, global shortcuts |
+  | **GNOME 46+** | ⚠️ works, but the overlay is an ordinary window: it takes focus, it is not click-through, and it will not stay over a fullscreen game. Mutter does not implement layer-shell. |
+
 - **An NVIDIA RTX card:**
 
   | Cards | Status |
   |---|---|
-  | **RTX 50** / **RTX 40** / **RTX 30** | ✅ works |
-  | **RTX 20** (Turing) | ❌ below the minimum architecture — the program starts, the picture is not processed |
-  | **Hybrid laptops (Optimus)** | ✅ works; on the iGPU display the capture falls back to a slower path |
+  | **RTX 50** (Blackwell) | ✅ works |
+  | **RTX 40** / **RTX 30** / **RTX 20** | ❌ NGX refuses the feature below Blackwell. The Windows build got past this with a spoof that has no Linux counterpart — see [TECHNICAL.md](TECHNICAL.md), "What did not come across". |
 
-- **The latest NVIDIA driver, and Windows up to date.** Not a formality: the
-  neural runtime talks to the driver directly, and an old driver is the
-  commonest reason it refuses to start or the picture never appears.
-- **Nothing installed.** The release archive brings its own Python.
+- **The proprietary NVIDIA driver, current.** Not a formality: the neural
+  runtime talks to it directly, and an old driver is the commonest reason it
+  refuses to start or the picture never appears. Nouveau will not do.
+- **xdg-desktop-portal** with your desktop's backend, and **PipeWire**. The
+  capture, the hotkeys and the file dialogs all come through the portal.
+- **Python 3.10+** and a handful of modules — the launcher names them and
+  the exact command if any are missing.
 
 ## Install
 
 1. Download the archive from [Releases](https://github.com/perseval-BLR/DLSS5-NeuralScreen/releases)
-   and unpack it anywhere. Everything is inside, including NVIDIA's runtime.
-2. Run **`NeuralScreen.exe`**.
+   and unpack it anywhere. NVIDIA's runtime is inside.
+2. Run **`./neuralscreen.sh`**. The first run builds the worker (a few
+   seconds, needs `g++`, `libvulkan-dev` and `libpipewire-0.3-dev`) and
+   writes a launcher entry so the program shows up in your application menu.
 
-Windows will probably warn you about an unknown publisher — the program is not
-signed with a paid certificate. Click *More info* → *Run anyway*, or use
-`NeuralScreen.vbs` next to it.
+There is no installer: to remove the program, delete the folder and run
+`./neuralscreen.sh --uninstall` first to take the launcher entry and the
+autostart file back out.
 
-There is no installer: to remove the program, delete the folder. Autostart is
-the one thing written outside it — turn it off before you move or delete it.
+**The first launch asks you two things, once:** a picker for the screen to
+capture, and a dialog for the hotkeys. That is Wayland's security model, not
+a missing feature — and it really is once, the program remembers what the
+portal gives back.
 
 > **Do not use it in competitive online games.** A fullscreen overlay over a
 > game is what anti-cheat systems look for.
@@ -60,7 +73,7 @@ the one thing written outside it — turn it off before you move or delete it.
 ## Using it
 
 The program sits in the tray and draws over your desktop. Press **Num2** for
-the menu. The hotkeys are on the numpad, so **Num Lock has to be on**.
+the menu.
 
 | Key | What it does |
 |---|---|
@@ -69,22 +82,28 @@ the menu. The hotkeys are on the numpad, so **Num Lock has to be on**.
 | **Num3** | screenshot |
 | **Num0** | start / stop recording, with sound |
 | **Num4** / **Num6** | processing resolution down / up |
-| **Num5** | capture the window under the cursor |
+| **Num5** | capture one window |
 | **Ctrl+Alt+Q** | quit |
 
-Every key can be reassigned in the menu, under the sliders icon. While the
-menu is open it takes the mouse and keyboard, so it works on top of a game;
-closed, clicks go straight through it.
+These are *preferences*, not commands: your compositor decides what the keys
+actually are and the menu shows what it chose. Change them under the sliders
+icon or in your desktop's own shortcut settings — both work. Num Lock makes
+no difference, unlike on Windows.
+
+While the menu is open it takes the mouse and keyboard, so it works on top of
+a game; closed, clicks go straight through it.
 
 ### Whole screen or one window
 
 The whole screen is the default. **Source**, at the top of the menu, switches
-between **Fullscreen** and **Window mode**; choosing the second opens the list
-of windows, and hovering a row highlights that window on the screen. **Num5**
-is the shortcut when the window is already in front of you: point at it and
-press. The overlay follows the window as it moves, and resizing it — a video
-going fullscreen, a different player size — reconfigures the worker in place,
-with no black moment. Minimising the window pauses processing.
+between **Fullscreen** and **Window mode**. Choosing the second opens your
+compositor's window picker — a client cannot capture another client's window
+without you saying so. **Num5** does the same from the keyboard.
+
+The overlay follows the window as it moves on **Hyprland** and **sway**,
+which tell clients where windows are; elsewhere it stays on the screen and
+the window's picture is drawn in place. Resizing reconfigures the worker in
+place, with no black moment.
 
 ## The menu
 
@@ -97,70 +116,84 @@ running on it, red when it is not.
   detail. **Save preset** stores the current values under a name and puts it
   in the Profile list; **Delete preset** removes it. Dark scenes are
   brightened automatically so shadows keep their detail.
-- **Before / after wipe** — leaves the left part of the screen unprocessed so
-  you can see what the effect is doing. Back to 0 when done.
-- **Boost** — on by default. The network runs at a reduced resolution and a
-  slider under the switch chooses which: measured on a 5070 Ti at 4K,
-  **45.7 → 72.6 frames** at the default step and **83.4** at the lowest.
-  The picture stays sharp — the network's result is composed onto your
-  original frame, so text and edges keep full resolution. Turn it off to
-  compare.
+- **Before / after wipe** — leaves the left part unprocessed so you can see
+  what the effect is doing. Back to 0 when done.
+- **Boost** — on by default. The network runs at a reduced resolution, and a
+  slider chooses which: measured on a 5070 Ti at 4K, **45.7 → 72.6 frames**
+  at the default step and **83.4** at the lowest. The picture stays sharp —
+  the result is composed onto your original frame, so text and edges keep
+  full resolution. Turn it off to compare.
 
 Everything else is behind the sliders icon: which monitor is processed and
-which card does it, HDR compatibility, the screenshot folder, Spout2 output,
-the recording indicator, leaving an unchanged screen alone, opening the menu
-on launch, autostart, the key assignments, the theme — and the language, of
-which there are **12**: English, Russian, French, German, Spanish, Italian,
-Portuguese, Polish, Ukrainian, Chinese, Japanese and Korean.
+which card does it, the screenshot folder, PipeWire
+output, the recording indicator, leaving an unchanged screen alone, opening
+the menu on launch, autostart, the key assignments, the theme — and the
+language, of which there are **12**: English, Russian, French, German,
+Spanish, Italian, Portuguese, Polish, Ukrainian, Chinese, Japanese and
+Korean.
 
 ## Recording and screenshots
 
-**Num0** records what you see, with system sound, into an MP4 in
-`recordings`. **Num3** saves a screenshot. The menu appears in both if it is
-open, on purpose. A red dot with a timer sits in the corner while recording
-(it can be turned off in the settings).
+**Num0** records what you see, with system sound, into an MP4 in your Videos
+folder. **Num3** saves a screenshot. The menu appears in both if it is open,
+on purpose. A red dot with a timer sits in the corner while recording (it can
+be turned off in the settings).
 
-Screenshots open a **Save As** dialog; set **Screenshot folder...** in the
-settings once and it will start there every time.
+Screenshots open your desktop's own Save dialog; set **Screenshot folder...**
+in the settings once and it will start there every time.
 
-**Recording externally:**
+**Recording externally:** an ordinary OBS Screen Capture (PipeWire) source on
+the same monitor sees the processed picture — the compositor composites the
+overlay rather than hiding it. On Windows the overlay had to hide from screen
+capture and OBS needed a Spout2 plugin to see anything.
 
-- **OBS (recommended):** turn on **Spout2 output (OBS)** in the settings, then
-  add a **Spout2 Capture** source in OBS. Works in any mode. Off by default.
-- **NVIDIA App:** it has no Spout input, so use one-window mode — pick the
-  window, record, then switch back to **Fullscreen**. In that mode the overlay
-  is visible to screen capture; in full-screen mode it hides itself.
+The **PipeWire output (OBS)** switch is the successor to that Spout2 bridge.
+**It is not implemented in this build** — the switch is there and the worker
+says so in the log. Use the Screen Capture source or Num0.
 
 ## If something is not working
 
 **Nothing appears after launch.** Check `NeuralScreen.log` next to the
-program — it names the cause. The commonest is a missing
-`native\nvngx_dlssnr.dll`.
+program — it names the cause. The `[env]` line at the top says which
+compositor you are on and whether it has a layer shell; start there.
 
-**The overlay is invisible in a game.** True fullscreen cannot have anything
-drawn over it — a Windows rule. Switch the game to *borderless*.
+**The overlay is behind everything, or steals focus.** Your compositor has no
+layer-shell (GNOME), and the `[env]` line says so. That is the fallback
+working, not a fault.
 
-**The menu pointer is missing or frozen.** A fullscreen game hides the system
-cursor, and the overlay only shows that one. Borderless fixes it.
+**No hotkeys at all.** Your portal backend ships no GlobalShortcuts (plain
+wlroots and niri). Adding yourself to the `input` group and logging back in
+enables the direct fallback; the tray icon opens the menu either way.
+
+**No tray icon on GNOME.** GNOME needs the AppIndicator extension. The menu
+is still on Num2.
+
+**A game covers the overlay.** True fullscreen hands the screen to one
+client. Switch the game to *borderless* — same as on Windows, same reason.
 
 **The picture is soft.** Turn *Boost* off, or move its slider up a step.
 
-**Everything is too bright and the sliders do nothing.** HDR is on for that
-display. Turn it off (Win+Alt+B), or try **HDR compatibility** in the settings,
-under CAPTURE — it is experimental; see [HDR setup](https://github.com/perseval-BLR/DLSS5-NeuralScreen/blob/main/docs/HDR.md).
-
-**A key does nothing.** Something else claimed it; reassign it in the menu.
+**Everything is washed out.** HDR is on for that display and the neural pass
+is treating it as SDR. Turn HDR off for that display — the **HDR
+compatibility** switch is not implemented in this build, and
+[docs/HDR.md](docs/HDR.md) says what it is waiting on.
 
 ## Known limitations
 
-- **True fullscreen games** cannot have an overlay drawn over them — borderless or windowed only.
-- **HDR displays:** experimental, and off until you turn on **HDR compatibility** (settings, CAPTURE). Recording and Spout exports stay SDR. See [HDR setup and limitations](https://github.com/perseval-BLR/DLSS5-NeuralScreen/blob/main/docs/HDR.md).
-- **Windows 10 and two NVIDIA cards are experimental** — built or fixed from user logs rather than tested here. Reports welcome.
-- **A rotated display:** 180° is turned back over on capture; 90° and 270° are not handled yet and come out with the sides swapped.
-- **Pipeline latency** is 40–60 ms (17-20ms with Boost Mode) — fine interactively, not competitively; **processing resolution is capped at 2560×1440**, output is always your full native resolution.
+- **Pre-Blackwell cards do not work.** See "What you need" above.
+- **GNOME** gets a downgraded overlay — Mutter implements no layer-shell.
+- **Window-follow needs Hyprland or sway.** No other compositor tells a
+  client where another client's window is, and none should.
+- **True fullscreen games** cannot have an overlay drawn over them.
+- **HDR displays are not handled.** The Windows build had a working HDR
+  path; the Wayland pieces it needs are only half-arrived. See
+  [docs/HDR.md](docs/HDR.md).
+- **Pipeline latency** is 40–60 ms (17–20 ms with Boost) — fine
+  interactively, not competitively; **processing resolution is capped at
+  2560×1440**, output is always your full native resolution.
 
 ## License
 
-The code here is MIT. NVIDIA's `nvngx_dlssnr.dll` is the leaked 310.8.0
-runtime (sm_75/86/89/120 kernels, RTX 20-50), included as-is, no
-guarantees, research-only. Interface faces: IBM Plex (OFL-1.1, `fonts/OFL.txt`).
+The code here is MIT. NVIDIA's `nvngx_dlssnr.so` is the leaked 310.8.0
+runtime (sm_75/86/89/120 kernels), included as-is, no guarantees,
+research-only. Interface faces: IBM Plex (OFL-1.1, `fonts/OFL.txt`).

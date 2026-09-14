@@ -18,7 +18,7 @@ Microsoft Basic Render Driver, which is exactly as unusable as an iGPU, so
 NS_GPU=1 takes the same branch. The worker is driven far enough to actually
 open the capture, and the log has to show one adapter, not two.
 
-Run:  runtime\\python.exe tests\\test_adapter_agreement.py
+Run:  python3 tests\\test_adapter_agreement.py
 """
 import ctypes
 import os
@@ -37,6 +37,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from main import (HEADER_FMT, NATIVE_DIR, PROFILES,  # noqa: E402
                   VIDEO_MAGIC, WORKER_EXE)
 from protocol import DDA_FMT, DDA_MAGIC  # noqa: E402
+
+from _needs import needs_worker  # noqa: E402
 
 W, H = 960, 540
 WARMUP = 4
@@ -61,6 +63,8 @@ def unusable_adapter_index() -> int | None:
 
 
 def main() -> int:
+    if (skip := needs_worker()) is not None:
+        return skip
     failures = []
 
     if not WORKER_EXE.is_file():

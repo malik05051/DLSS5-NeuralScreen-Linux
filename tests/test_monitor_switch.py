@@ -1,186 +1,157 @@
-"""Monitor switch must never crash the app (issues #24/#26).
+"""A stale monitor must never take the program down (issues #24/#26).
 
-The dxcam factory caches the output list at the first import; a monitor
-unplugged or a dock changed after that leaves stale indices, and
-dxcam.create(output_idx=N) raises IndexError for them ('list index out of
-range' in the user log). ScreenCapture now validates the index, refreshes
-the factory once, and falls back to output 0 - the capture must never take
-the app down.
+The Windows shape of this bug: the dxcam factory cached its output list at
+import, a monitor unplugged or a dock changed after that left stale indices,
+and dxcam.create(output_idx=N) raised IndexError for them - "list index out
+of range" in the user's log, on launch.
 
-The real ScreenCapture.__init__ runs in every scenario; only the dxcam
-module (create + factory) and the two helpers are faked.
+The Linux shape is the same bug with different nouns. The output list is
+cached for the same reason (the menu asks on every frame it is open, and a
+Wayland roundtrip per frame costs more than the network does), and it goes
+stale for exactly the same reasons: a cable, a dock, a display reorder. What
+changed is the recovery, and it is better: the config remembers the
+connector name ("DP-1"), which survives a reorder, and when the name really
+is gone the portal asks the user which screen to use instead of the program
+guessing.
 
 Checked:
-* an out-of-range index triggers a factory refresh and falls back to 0;
-* an IndexError from dxcam.create() (topology changed between the check
-  and the create) is caught, the factory is refreshed, and the capture
-  still opens on the same index;
-* when the output is really gone (IndexError on every create) the
-  exception propagates - main._switch_monitor wraps the call and falls
-  back to the primary output;
-* a devicename that resolves to a stale index still opens (the same
-  refresh path).
+  * an out-of-range index re-enumerates and falls back to 0 rather than
+    raising;
+  * a connector name that no longer exists is not fatal - it drops the
+    restore token, so the portal shows its picker instead of silently
+    restoring a monitor that is not there;
+  * a name that does exist resolves to its index and keeps the token, which
+    is what makes the second launch silent;
+  * the resolution comes back with the output's rotation applied. The
+    Windows build could not do this at all: 90 and 270 came out with the
+    sides swapped, and it is a known limitation there.
+
+Run:  python3 test_monitor_switch.py
 """
+import os
 import sys
 import types
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parent.parent  # the project root
-sys.path.insert(0, str(BASE))  # the project modules (main.py, capture.py, ...)
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ (autocheck)
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import capture  # noqa: E402
+import portal  # noqa: E402
 from capture import ScreenCapture  # noqa: E402
 
 
-class _FakeCamera:
-    """The minimal surface ScreenCapture touches after dxcam.create()."""
-
-    def __init__(self, devicename="\\\\.\\DISPLAY1", resolution=(1920, 1080)):
-        self._output = types.SimpleNamespace(
-            devicename=devicename, resolution=resolution)
-        self.released = False
-
-    def grab(self):
-        return None
-
-    def release(self):
-        self.released = True
+def fake_output(name, w=1920, h=1080, x=0, y=0, transform=0):
+    """An Output as wayland_shell reports one, with nothing behind it."""
+    return types.SimpleNamespace(
+        name=name, description=f"{name} display", width=w, height=h,
+        logical_w=w, logical_h=h, x=x, y=y, scale=1, transform=transform,
+        refresh=60000, rotated=transform in (1, 3, 5, 7), proxy=None)
 
 
-def _install_fake_dxcam(create_impl):
-    """Replace sys.modules['dxcam'] with a fake whose create() is scripted.
+class _FakeSession:
+    """A granted ScreenCast session, without a portal."""
 
-    Returns the previous module for restoration.
-    """
-    fake = types.ModuleType("dxcam")
-    fake.create = create_impl
-    fake.__factory = types.SimpleNamespace(outputs=[[None]])
-    old = sys.modules.get("dxcam")
-    sys.modules["dxcam"] = fake
-    return old
+    def __init__(self, node=7, size=(1920, 1080), token="tok"):
+        self.node_id = node
+        self.fd = 99
+        self.size = size
+        self.position = (0, 0)
+        self.restore_token = token
+        self.source_type = 1
+        self.mapping_id = ""
+        self.session_handle = "/fake"
+        self.closed = False
+
+    @property
+    def ok(self):
+        return True
+
+    def close(self):
+        self.closed = True
 
 
 def main() -> int:
     failures = []
-    real_count = capture._output_count
-    real_refresh = capture._refresh_dxcam_factory
-    real_resolve = capture.resolve_output_idx
-    real_dxcam = sys.modules.get("dxcam")
+    real_outputs = capture._outputs
+    real_refresh = capture.refresh_outputs
+    real_open = portal.open_screencast
+    real_gst = ScreenCapture._start_gstreamer
 
-    # 1. Out-of-range index: refresh the factory, then fall back to 0.
+    outputs = [fake_output("DP-1", 3840, 2160),
+               fake_output("HDMI-A-1", 2560, 1440, x=3840)]
     events = []
-    calls = []
-    capture._output_count = lambda: 1  # only output 0 exists
-    capture._refresh_dxcam_factory = lambda: events.append("refresh")
+    asked = []
 
-    def create1(output_idx=0, **kw):
-        calls.append(output_idx)
-        return _FakeCamera()
+    capture._outputs = lambda: outputs
+    capture.refresh_outputs = lambda: events.append("refresh")
+    portal.open_screencast = lambda **kw: (asked.append(kw)
+                                           or _FakeSession())
+    # The GStreamer fallback path is not what this test is about, and
+    # starting it would need a real PipeWire remote behind the fake fd.
+    ScreenCapture._start_gstreamer = lambda self: None
 
-    _install_fake_dxcam(create1)
     try:
+        # 1. An index past the end of the list: re-enumerate, fall back to 0.
+        asked.clear()
+        events.clear()
         cap = ScreenCapture(monitor_idx=5)
+        if "refresh" not in events:
+            failures.append("an out-of-range index did not re-enumerate")
         if cap.monitor_idx != 0:
             failures.append(f"out-of-range index did not fall back: "
                             f"monitor_idx={cap.monitor_idx}")
-        if "refresh" not in events:
-            failures.append("out-of-range index did not refresh the factory")
-        if calls != [0]:
-            failures.append(f"create called with {calls}, want [0]")
-    finally:
-        capture._output_count = real_count
-        capture._refresh_dxcam_factory = real_refresh
-        if real_dxcam is not None:
-            sys.modules["dxcam"] = real_dxcam
+        if cap.devicename != "DP-1":
+            failures.append(f"the fallback opened {cap.devicename!r}, "
+                            "expected the first output")
 
-    # 2. IndexError from dxcam.create(): refresh + retry, still opens.
-    events = []
-    calls = []
-    capture._output_count = lambda: 2  # the index looks valid
-    capture._refresh_dxcam_factory = lambda: events.append("refresh")
-
-    def create2(output_idx=0, **kw):
-        calls.append(output_idx)
-        if len(calls) == 1:
-            raise IndexError("list index out of range")
-        return _FakeCamera()
-
-    _install_fake_dxcam(create2)
-    try:
-        cap = ScreenCapture(monitor_idx=1)
+        # 2. A connector name that is still there resolves to its index, and
+        #    the restore token is carried into the portal call - that is what
+        #    makes every launch after the first one silent.
+        asked.clear()
+        cap = ScreenCapture(devicename="HDMI-A-1", restore_token="remembered")
         if cap.monitor_idx != 1:
-            failures.append(f"IndexError retry lost the index: "
-                            f"monitor_idx={cap.monitor_idx}")
-        if "refresh" not in events:
-            failures.append("IndexError path did not refresh the factory")
-        if calls != [1, 1]:
-            failures.append(f"create called with {calls}, want [1, 1]")
+            failures.append(f"HDMI-A-1 resolved to {cap.monitor_idx}, want 1")
+        if not asked or asked[-1].get("restore_token") != "remembered":
+            failures.append("the restore token was not handed to the portal - "
+                            "the user would be asked again on every launch")
+
+        # 3. A name that is gone is not fatal, and the stale token is
+        #    dropped: restoring a monitor that is not connected is exactly
+        #    what the picker is for.
+        asked.clear()
+        cap = ScreenCapture(devicename="DP-9", restore_token="stale")
+        if asked and asked[-1].get("restore_token"):
+            failures.append("a stale token was still sent - the portal would "
+                            "restore a monitor that is not there")
+
+        # 4. Rotation: the capture produces the rotated picture, so the
+        #    rotated numbers are the ones everything downstream is built
+        #    from.
+        outputs.append(fake_output("DP-2", 3840, 2160, transform=1))
+        size = capture._physical_size(outputs[-1])
+        if size != (2160, 3840):
+            failures.append(f"a 90-degree output reports {size}, "
+                            "expected the sides swapped")
+        listed = dict((name, (w, h)) for _i, w, h, name
+                      in capture.list_monitors())
+        if listed.get("DP-2") != (2160, 3840):
+            failures.append(f"list_monitors did not rotate DP-2: {listed}")
     finally:
-        capture._output_count = real_count
-        capture._refresh_dxcam_factory = real_refresh
-        if real_dxcam is not None:
-            sys.modules["dxcam"] = real_dxcam
+        capture._outputs = real_outputs
+        capture.refresh_outputs = real_refresh
+        portal.open_screencast = real_open
+        ScreenCapture._start_gstreamer = real_gst
 
-    # 3. IndexError on every create (the output is really gone): the
-    #    exception propagates - main._switch_monitor wraps the call.
-    calls = []
-    capture._output_count = lambda: 2
-    capture._refresh_dxcam_factory = lambda: None
-
-    def create3(output_idx=0, **kw):
-        calls.append(output_idx)
-        raise IndexError("list index out of range")
-
-    _install_fake_dxcam(create3)
-    try:
-        try:
-            ScreenCapture(monitor_idx=1)
-            failures.append("double IndexError did not raise")
-        except IndexError:
-            pass
-        if calls != [1, 1, 0]:
-            failures.append(f"create called with {calls}, want [1, 1, 0]")
-    finally:
-        capture._output_count = real_count
-        capture._refresh_dxcam_factory = real_refresh
-        if real_dxcam is not None:
-            sys.modules["dxcam"] = real_dxcam
-
-    # 4. A devicename resolving to a stale index still opens (the same
-    #    refresh path as #1, through the devicename branch).
-    events = []
-    calls = []
-    capture.resolve_output_idx = lambda dev: 7  # stale index
-    capture._output_count = lambda: 1
-    capture._refresh_dxcam_factory = lambda: events.append("refresh")
-
-    def create4(output_idx=0, **kw):
-        calls.append(output_idx)
-        return _FakeCamera()
-
-    _install_fake_dxcam(create4)
-    try:
-        cap = ScreenCapture(devicename="\\\\.\\DISPLAY1")
-        if cap.monitor_idx != 0:
-            failures.append(f"stale devicename index did not fall back: "
-                            f"monitor_idx={cap.monitor_idx}")
-        if "refresh" not in events:
-            failures.append("stale devicename index did not refresh")
-        if calls != [0]:
-            failures.append(f"create called with {calls}, want [0]")
-    finally:
-        capture.resolve_output_idx = real_resolve
-        capture._output_count = real_count
-        capture._refresh_dxcam_factory = real_refresh
-        if real_dxcam is not None:
-            sys.modules["dxcam"] = real_dxcam
-
-    for fl in failures:
-        print("FAIL:", fl)
     if failures:
+        print("FAIL:")
+        for f in failures:
+            print(f"  - {f}")
         return 1
-    print("OK: monitor switch cannot crash the capture")
+    print("OK: stale indices fall back, names resolve, tokens are kept or "
+          "dropped, rotation is applied")
     return 0
 
 

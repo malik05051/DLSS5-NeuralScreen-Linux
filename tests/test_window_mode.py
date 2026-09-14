@@ -28,7 +28,7 @@ show it on the whole screen, where hiding is still mandatory.
 
 Requires NeuralScreen not to be running. ~40 seconds.
 
-Run:  runtime\\python.exe test_window_mode.py
+Run:  python3 test_window_mode.py
 """
 import ctypes
 import ctypes.wintypes
@@ -51,6 +51,8 @@ except Exception:
         pass
 
 import autocheck  # noqa: E402  - launch/log/quit helpers live there
+
+from _needs import needs_wayland  # noqa: E402
 
 W, H = 960, 540
 TARGET = (31, 97, 211)
@@ -139,6 +141,8 @@ def toggle_numlock() -> None:
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     busy = autocheck.running_instances()
     if busy:
         print(f"FAIL: NeuralScreen is already running ({busy}) - stop it first")

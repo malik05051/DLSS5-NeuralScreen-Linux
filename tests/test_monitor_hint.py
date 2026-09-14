@@ -15,7 +15,7 @@ So the picker carries the sentence. Two rules that are easy to break later:
   taller, and a click on the explanation must not open the drop-down (which
   test_choice_hint_hit pins for the control in general).
 
-Run:  runtime\\python.exe tests\\test_monitor_hint.py
+Run:  python3 tests\\test_monitor_hint.py
 """
 import os
 import sys

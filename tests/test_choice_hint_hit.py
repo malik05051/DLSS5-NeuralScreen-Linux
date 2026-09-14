@@ -14,7 +14,7 @@ so it compares the overwritten strip against itself and cannot see it.
 Expected: after draw() the strip is still the control height, and a
 click in the hint band is not the row. [audit ui-display]
 
-Run:  runtime\\python.exe tests\\test_choice_hint_hit.py
+Run:  python3 tests\\test_choice_hint_hit.py
 """
 import os
 import sys

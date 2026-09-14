@@ -10,7 +10,7 @@ drag it to the captured window (the reported window-mode glitch: the
 veil slid by the top and left edges, the bare desktop showing) and the
 layer-shrink helpers must be no-ops until it is down.
 
-Run:  runtime\\python.exe tests\\test_switch_veil.py
+Run:  python3 tests\\test_switch_veil.py
 """
 import os
 import sys
@@ -28,12 +28,16 @@ import pipeline  # noqa: E402
 import numpy as np  # noqa: E402
 import pygame  # noqa: E402
 
+from _needs import needs_wayland  # noqa: E402
+
 
 def _dist_from_center(tile, w, h):
     return ((tile[0] - w / 2.0) ** 2 + (tile[1] - h / 2.0) ** 2) ** 0.5
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     failures = []
     W, H = 1920, 1080
 

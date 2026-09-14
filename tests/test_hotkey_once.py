@@ -14,7 +14,7 @@ cooldown. A press is an edge, not a state.
 F13 is the test key: nothing else on the machine uses it, and no physical
 keyboard sends it by accident.
 
-Run:  runtime\\python.exe test_hotkey_once.py
+Run:  python3 test_hotkey_once.py
 """
 import ctypes
 import queue

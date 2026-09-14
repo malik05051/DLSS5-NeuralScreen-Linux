@@ -11,7 +11,7 @@ Expected: a main-loop tick evaluates the verdict, or the call chain
 reaches refresh_gpu_ok from a place that runs with the menu closed.
 [audit python-core F12]
 
-Run:  runtime\\python.exe tests\\test_gpu_alert_path.py
+Run:  python3 tests\\test_gpu_alert_path.py
 """
 import re
 import sys

@@ -30,8 +30,8 @@ STATE = {
     "split": 0.0, "open_on_start": True,
     "gpu_text": "RTX 5070 Ti · Blackwell", "gpu_ok": True,
     "window_mode": True,
-    "windows": ["1A2B3C: Notepad", "4D5E6F: Chrome - YouTube"],
-    "window_current": "1A2B3C: Notepad",
+    "windows": ["wl:1\tNotepad", "wl:2\tChrome - YouTube"],
+    "window_current": "wl:1\tNotepad",
 }
 
 
@@ -96,16 +96,20 @@ def main() -> int:
     print(f"window rows: {[(r.payload, r.extra.get('selected')) for r in rows]}")
     if len(rows) != 2:
         failures.append(f"expected 2 window rows, got {len(rows)}")
-    if not any(r.payload == "1A2B3C: Notepad" and r.extra.get("selected")
+    if not any(r.payload == "wl:1\tNotepad" and r.extra.get("selected")
                for r in rows):
         failures.append("the current window should be marked selected")
 
-    # 3. Hovering a row reports the hwnd (the hex prefix).
-    row = next(r for r in rows if r.payload == "4D5E6F: Chrome - YouTube")
+    # 3. Hovering a row reports the window handle (the part before the tab).
+    #    The handle is opaque - toplevels.py decides what it means - so the
+    #    only thing to check is that the menu passes it through untouched
+    #    and does not try to parse it, which is what the hex prefix used to
+    #    invite.
+    row = next(r for r in rows if r.payload == "wl:2\tChrome - YouTube")
     hover(menu, row)
-    print(f"hover -> hover_window 0x{menu.hover_window:X}")
-    if menu.hover_window != 0x4D5E6F:
-        failures.append(f"hover should report 0x4D5E6F, got {menu.hover_window}")
+    print(f"hover -> hover_window {menu.hover_window!r}")
+    if menu.hover_window != "wl:2":
+        failures.append(f"hover should report 'wl:2', got {menu.hover_window!r}")
 
     # 4. Moving off the rows clears the highlight.
     menu.handle_event(pygame.event.Event(
@@ -117,7 +121,7 @@ def main() -> int:
     # 5. Clicking a row emits the window command with the hwnd.
     out = click(menu, row)
     print(f"row click -> {out}")
-    if ("window", "4D5E6F: Chrome - YouTube") not in out:
+    if ("window", "wl:2\tChrome - YouTube") not in out:
         failures.append(f"the row click should emit (window, ...), got {out}")
 
     # 6. Back returns to the main page and clears the highlight.

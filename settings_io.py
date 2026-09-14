@@ -14,16 +14,16 @@ from __future__ import annotations
 import json
 import os
 import sys
-import winreg
 from pathlib import Path
 
-from paths import BASE_DIR
+import taskbar
+from paths import AUTOSTART_FILE, BASE_DIR
 from capture import devicename_for_output_idx, list_adapters, list_monitors
 from i18n import STRINGS as UI_STRINGS
 # The work caps are the worker's contract, not a setting: the same two
 # numbers size the shared motion buffer in the SHMI handshake.
 from protocol import WORK_MAX_H, WORK_MAX_W  # noqa: F401
-from winapi import list_capturable_windows
+from toplevels import list_capturable_windows
 
 
 def _work_size(width: int, height: int, scale: float) -> tuple[int, int]:
@@ -87,34 +87,42 @@ def _next_preset_name(presets: dict) -> str:
 
 
 def _set_autostart(enabled: bool) -> bool:
-    """Enable/disable autostart with Windows (HKCU Run).
+    """Enable/disable starting with the session. True on success.
 
-    We launch NeuralScreen.vbs through wscript - a hidden launcher with no
-    console. Returns True on success.
+    The XDG autostart directory: a .desktop file in ~/.config/autostart is
+    read by every desktop environment, which is as close as Linux gets to
+    HKCU\...\Run and is a good deal easier to inspect - it is a text file
+    the user can open, and deleting it is the whole uninstall.
+
+    Written from the program's real location every time it is turned on,
+    for the same reason the launcher entry is: the archive is unpacked
+    anywhere and moving the folder must not leave a dead autostart entry
+    behind.
     """
-    import winreg
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Run",
-                             0, winreg.KEY_SET_VALUE)
-        if enabled:
-            vbs = str(BASE_DIR / "NeuralScreen.vbs")
-            winreg.SetValueEx(key, "NeuralScreen", 0, winreg.REG_SZ,
-                              f'wscript.exe "{vbs}"')
-        else:
+        if not enabled:
             try:
-                winreg.DeleteValue(key, "NeuralScreen")
+                AUTOSTART_FILE.unlink()
             except FileNotFoundError:
                 pass
-        winreg.CloseKey(key)
+            return True
+        AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+        AUTOSTART_FILE.write_text(
+            taskbar.DESKTOP_ENTRY.format(
+                exec=taskbar.launcher_path(),
+                icon=str(BASE_DIR / "native" / "neuralscreen.png"))
+            + "X-GNOME-Autostart-enabled=true\n",
+            encoding="utf-8")
+        AUTOSTART_FILE.chmod(0o755)
         return True
-    except Exception as exc:
+    except OSError as exc:
         print(f"[main] autostart not configured: {exc}", file=sys.stderr)
         return False
 
 
-# The version shown in the menu header. Kept in sync with native/launcher.rc
-# (FileVersion/ProductVersion) and build_release_zip.py at release time.
+# The version shown in the menu header. Kept in sync with build_release.py
+# at release time - it is the one other place the number is written, and
+# VERSION.txt in the archive is built from it.
 APP_VERSION = "1.8.2"
 
 
@@ -308,20 +316,10 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 
 
 def _autostart_enabled() -> bool:
-    """Is autostart currently on? (HKCU Run, the NeuralScreen value)."""
-    import winreg
+    """Is autostart currently on? (~/.config/autostart/neuralscreen.desktop)"""
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Run",
-                             0, winreg.KEY_READ)
-        try:
-            winreg.QueryValueEx(key, "NeuralScreen")
-            return True
-        except FileNotFoundError:
-            return False
-        finally:
-            winreg.CloseKey(key)
-    except Exception:
+        return AUTOSTART_FILE.is_file()
+    except OSError:
         return False
 
 
@@ -615,9 +613,13 @@ def menu_payload(st) -> dict:
             (m for m in monitor_entries
              if m.startswith(f"{st.monitor}: ")),
             str(st.monitor)),
-        "windows": [f"{h:X}: {t}" for h, t in wins],
+        # "handle\ttitle": the handle is opaque (see toplevels.py) and the
+        # tab keeps it separable from a title that contains a colon, which
+        # the Windows build's "%X: %s" could not - every browser tab with a
+        # URL in its title was one.
+        "windows": [f"{h}\t{t}" for h, t in wins],
         "window_current": next(
-            (f"{h:X}: {t}" for h, t in wins if h == st.window_hwnd), ""),
+            (f"{h}\t{t}" for h, t in wins if h == st.window_hwnd), ""),
         "version": APP_VERSION,
         "channel": CHANNEL_LABEL,
     }

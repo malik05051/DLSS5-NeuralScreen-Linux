@@ -19,7 +19,7 @@ So the protocol got its own handle: fd 1 is duplicated for our writes and
 the real fd 1 is pointed at stderr. NS_STDOUT_NOISE=1 makes the worker
 print exactly that kind of line on purpose, right where it did damage.
 
-Run:  runtime\\python.exe tests\\test_stdout_noise.py
+Run:  python3 tests\\test_stdout_noise.py
 """
 import os
 import struct
@@ -29,6 +29,8 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+
+from _needs import needs_worker  # noqa: E402
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
@@ -115,6 +117,8 @@ def run(shared: bool):
 
 
 def main() -> int:
+    if (skip := needs_worker()) is not None:
+        return skip
     failures = []
     source = (BASE / "native" / "dlss5-feed-host64.cpp").read_text(encoding="utf-8")
     if "OwnTheProtocolPipe" not in source:

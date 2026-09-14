@@ -21,6 +21,8 @@ sys.path.insert(0, BASE)
 import pygame  # noqa: E402
 import display as display_mod  # noqa: E402
 
+from _needs import needs_wayland  # noqa: E402
+
 
 def _is_red(p) -> bool:
     """The danger colour #BC4C2E = (188, 76, 46); the chroma key is
@@ -29,6 +31,8 @@ def _is_red(p) -> bool:
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     failures = []
     pygame.init()
     try:

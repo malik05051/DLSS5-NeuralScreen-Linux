@@ -1,178 +1,95 @@
-"""Native file dialogs and the screenshot writer.
+"""Save As and the folder picker, through the FileChooser portal.
 
-Leaf Windows code: it takes a window handle, shows a system dialog and hands
-back a path. Nothing here knows about the pipeline, which is why it could
-leave main() - and why the screenshot writer belongs here too rather than
-being copied into a test.
+On Windows these were GetSaveFileNameW and SHBrowseForFolder: a program
+drew the system's own dialog inside its own process, parented to its own
+window. On Wayland a client does not draw system dialogs and does not have
+a window handle to parent one to - the desktop draws the chooser, in its own
+process, and hands back a path. Which is why the `parent_hwnd` argument is
+gone from these signatures rather than ignored: a parameter that does
+nothing is worse than one that is not there.
 
-Both dialogs are the classic Win32 ones (GetSaveFileNameW,
-SHBrowseForFolderW). They block the thread that calls them, so the caller
-runs them off the main loop - the overlay must keep drawing while a dialog
-is open.
+The calls block, and they block for as long as it takes: a person deciding
+where a screenshot goes is not on a computer's schedule. commands.py already
+ran the Windows dialogs on a worker thread for exactly that reason, and that
+is unchanged.
 """
 from __future__ import annotations
 
-import ctypes
 import sys
-import time
-from ctypes import wintypes
 from pathlib import Path
 
-
-class _OPENFILENAME(ctypes.Structure):
-    _fields_ = [
-        ("lStructSize", wintypes.DWORD),
-        ("hwndOwner", wintypes.HWND),
-        ("hInstance", wintypes.HINSTANCE),
-        ("lpstrFilter", wintypes.LPCWSTR),
-        ("lpstrCustomFilter", wintypes.LPWSTR),
-        ("nMaxCustFilter", wintypes.DWORD),
-        ("nFilterIndex", wintypes.DWORD),
-        ("lpstrFile", wintypes.LPWSTR),
-        ("nMaxFile", wintypes.DWORD),
-        ("lpstrFileTitle", wintypes.LPWSTR),
-        ("nMaxFileTitle", wintypes.DWORD),
-        ("lpstrInitialDir", wintypes.LPCWSTR),
-        ("lpstrTitle", wintypes.LPCWSTR),
-        ("Flags", wintypes.DWORD),
-        ("nFileOffset", wintypes.WORD),
-        ("nFileExtension", wintypes.WORD),
-        ("lpstrDefExt", wintypes.LPCWSTR),
-        ("lCustData", wintypes.LPARAM),
-        ("lpfnHook", wintypes.LPVOID),
-        ("lpTemplateName", wintypes.LPCWSTR),
-        ("pvReserved", wintypes.LPVOID),
-        ("dwReserved", wintypes.DWORD),
-        ("FlagsEx", wintypes.DWORD),
-    ]
+import portal
+from dbusio import BUS  # noqa: F401  (re-exported for the fallback check)
 
 
-class _BROWSEINFO(ctypes.Structure):
-    _fields_ = [
-        ("hwndOwner", wintypes.HWND),
-        ("pidlRoot", wintypes.LPVOID),
-        ("pszDisplayName", wintypes.LPWSTR),
-        ("lpszTitle", wintypes.LPCWSTR),
-        ("ulFlags", wintypes.UINT),
-        ("lpfn", wintypes.LPVOID),
-        ("lParam", wintypes.LPARAM),
-        ("iImage", ctypes.c_int),
-    ]
+def ask_save_path(default_name: str, initial_dir: "Path | None" = None,
+                  fallback_dir: "Path | None" = None,
+                  title: str = "Save screenshot",
+                  filters: "list[tuple[str, list[str]]] | None" = None
+                  ) -> Path | None:
+    """A Save As dialog. The chosen path, or None when the user cancelled.
 
+    The portal appends no extension of its own, so the filter list is
+    advisory and the caller stays responsible for the suffix - same as the
+    Windows version, where OFN_OVERWRITEPROMPT did the asking and
+    lpstrDefExt did the appending.
 
-def _save_dialog_struct(parent_hwnd: int, default_name: str,
-                        initial_dir: str | None):
-    """The OPENFILENAME for "Save as", and the buffer the path comes back in.
-
-    Separate from the call because this is the part that was broken and
-    nobody saw it: `ofn.lpstrFile = buf` assigns a c_wchar array to an
-    LPWSTR field, and ctypes refuses - "incompatible types,
-    c_wchar_Array_1024 instance instead of c_wchar_p instance". The
-    TypeError was caught by the wrapper below, which quietly fell back to
-    the screenshots folder, so the dialog never opened for anyone and the
-    only trace was one line in the log. The array has to be cast to the
-    pointer type. As a function it can be tested without a modal dialog
-    on screen (tests/test_save_dialog.py).
+    `fallback_dir` is where the file goes when there is no chooser at all -
+    no session bus, no portal. Not when the user cancels: cancelling means
+    they did not want the file, and writing it anyway would be the program
+    overruling them.
     """
-    buf = ctypes.create_unicode_buffer(1024)
-    buf.value = default_name
-    ofn = _OPENFILENAME()
-    ofn.lStructSize = ctypes.sizeof(_OPENFILENAME)
-    ofn.hwndOwner = parent_hwnd or None
-    ofn.lpstrFilter = ("JPEG image (*.jpg)\0*.jpg\0PNG image (*.png)\0"
-                       "*.png\0All files (*.*)\0*.*\0")
-    ofn.lpstrFile = ctypes.cast(buf, wintypes.LPWSTR)
-    ofn.nMaxFile = 1024
-    ofn.lpstrDefExt = "jpg"
-    ofn.lpstrInitialDir = initial_dir or None
-    # OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST
-    ofn.Flags = 0x00000002 | 0x00000008
-    return ofn, buf
-
-
-def ask_save_path(parent_hwnd: int, default_name: str,
-                  initial_dir: str | None = None,
-                  fallback_dir: Path | None = None) -> Path | None:
-    """The native "Save as" dialog. The chosen path, or None on cancel.
-
-    The JPEG filter is the default and the extension is appended when the
-    user leaves it out. initial_dir is the folder the dialog opens in (the
-    configured screenshot folder, if any).
-
-    If the dialog itself cannot be shown, a screenshot must not be lost: the
-    answer is then a timestamped name inside fallback_dir.
-    """
-    try:
-        ofn, buf = _save_dialog_struct(parent_hwnd, default_name, initial_dir)
-        if not ctypes.windll.comdlg32.GetSaveFileNameW(ctypes.byref(ofn)):
-            return None
-        path = Path(buf.value.strip())
-        if not path.suffix:
-            path = path.with_suffix(".jpg")
-        return path
-    except Exception as exc:
-        print(f"[dialogs] save dialog unavailable ({exc}) - "
-              f"the screenshot goes to the fallback folder", file=sys.stderr)
+    folder = str(initial_dir) if initial_dir else ""
+    if filters is None:
+        filters = [("JPEG image", ["*.jpg", "*.jpeg"]),
+                   ("PNG image", ["*.png"])]
+    if not portal.BUS.connect():
         if fallback_dir is None:
             return None
+        fallback_dir = Path(fallback_dir)
         fallback_dir.mkdir(parents=True, exist_ok=True)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        stamp = f"{stamp}-{time.time() % 1 * 1000:03.0f}"
-        return fallback_dir / f"neuralscreen-{stamp}.jpg"
-
-
-def pick_directory(parent_hwnd: int, title: str) -> Path | None:
-    """The classic folder picker. The chosen folder, or None on cancel.
-
-    SHBrowseForFolder needs COM on the calling thread, and the caller runs
-    this on a thread of its own (the dialog blocks), so the apartment is
-    initialised and torn down here rather than assumed.
-    """
+        print(f"[dialogs] no file chooser on this session - saving to "
+              f"{fallback_dir}", file=sys.stderr)
+        return fallback_dir / default_name
     try:
-        ole32 = ctypes.WinDLL("ole32")
-        ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
-        try:
-            shell32 = ctypes.WinDLL("shell32")
-            shell32.SHBrowseForFolderW.argtypes = [ctypes.POINTER(_BROWSEINFO)]
-            shell32.SHBrowseForFolderW.restype = wintypes.LPVOID
-            shell32.SHGetPathFromIDListW.argtypes = [wintypes.LPVOID,
-                                                     wintypes.LPWSTR]
-            shell32.SHGetPathFromIDListW.restype = wintypes.BOOL
-            buf = ctypes.create_unicode_buffer(260)
-            bi = _BROWSEINFO()
-            bi.hwndOwner = parent_hwnd or None
-            bi.lpszTitle = title
-            bi.ulFlags = 0x0001  # BIF_RETURNONLYFSDIRS
-            pidl = shell32.SHBrowseForFolderW(ctypes.byref(bi))
-            if pidl and shell32.SHGetPathFromIDListW(pidl, buf):
-                return Path(buf.value.strip())
-            return None
-        finally:
-            ole32.CoUninitialize()
+        chosen = portal.save_file(title, default_name, folder, filters)
     except Exception as exc:
-        print(f"[dialogs] folder picker failed: {exc}", file=sys.stderr)
+        print(f"[dialogs] the file chooser failed: {exc}", file=sys.stderr)
         return None
+    return Path(chosen) if chosen else None
+
+
+def pick_directory(title: str = "Choose a folder",
+                   initial_dir: "Path | None" = None) -> Path | None:
+    """A folder picker. The chosen directory, or None when cancelled."""
+    folder = str(initial_dir) if initial_dir else ""
+    try:
+        chosen = portal.pick_folder(title, folder)
+    except Exception as exc:
+        print(f"[dialogs] the folder chooser failed: {exc}", file=sys.stderr)
+        return None
+    if not chosen:
+        return None
+    path = Path(chosen)
+    return path if path.is_dir() else None
 
 
 def save_jpeg(path: Path, rgba) -> bool:
-    """Write an RGBA frame as a maximum-quality JPEG. True when it landed.
+    """Write an RGBA frame as a JPEG. False on any failure.
 
-    imencode + write_bytes, NOT cv2.imwrite: OpenCV opens the file through
-    the C runtime with the ANSI codepage, so a path with any non-ASCII
-    character writes NOTHING - and imwrite still answers True. Measured: a
-    Cyrillic folder gave "True" and no file, and the program told the user
-    the screenshot had been saved. Encoding to memory and writing the bytes
-    through Python leaves the path to Python, which handles it in UTF-16.
-
-    The result is checked on disk before the answer: "the encoder said yes"
-    is not the same as "the file is there".
+    Unchanged from the Windows build except for what does the writing:
+    there it was the WIC encoder through COM, here it is Pillow, which the
+    program already carries for the tray icon. Quality 95 and 4:4:4
+    chroma - a screenshot of text at 4:2:0 is a screenshot of coloured
+    fringes.
     """
-    import cv2
+    try:
+        from PIL import Image
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA),
-                           [cv2.IMWRITE_JPEG_QUALITY, 100])
-    if not ok:
+        array = rgba[:, :, :3] if rgba.shape[2] == 4 else rgba
+        Image.fromarray(array, "RGB").save(
+            path, "JPEG", quality=95, subsampling=0, optimize=True)
+        return True
+    except Exception as exc:
+        print(f"[dialogs] could not write {path}: {exc}", file=sys.stderr)
         return False
-    path.write_bytes(buf.tobytes())
-    return path.is_file() and path.stat().st_size > 0

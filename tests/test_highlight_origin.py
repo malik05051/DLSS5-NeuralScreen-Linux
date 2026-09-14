@@ -10,7 +10,7 @@ which is why it has not been reported.
 Expected: the drawn rect is the screen rect minus the layer origin.
 [audit ui-display]
 
-Run:  runtime\\python.exe tests\\test_highlight_origin.py
+Run:  python3 tests\\test_highlight_origin.py
 """
 import ctypes
 import os
@@ -32,8 +32,12 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402
 
+from _needs import needs_wayland  # noqa: E402
+
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     failures = []
     pygame.init()
     disp = None

@@ -9,7 +9,7 @@ coverage) works; the size regresses.
 Expected: after set_lang the alert font keeps the __init__ height.
 [audit ui-display]
 
-Run:  runtime\\python.exe tests\\test_alert_font_size.py
+Run:  python3 tests\\test_alert_font_size.py
 """
 import os
 import sys
@@ -29,8 +29,12 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame  # noqa: E402
 
+from _needs import needs_wayland  # noqa: E402
+
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     failures = []
     pygame.init()
     disp = None

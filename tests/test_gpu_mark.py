@@ -17,7 +17,7 @@ what the picker says - and it says it as a note, not a lock:
 * the index in the label is untouched, because that is what the action is
   parsed from.
 
-Run:  runtime\\python.exe tests\\test_gpu_mark.py
+Run:  python3 tests\\test_gpu_mark.py
 """
 import sys
 import types

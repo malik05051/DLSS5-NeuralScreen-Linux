@@ -14,7 +14,7 @@ panel.
 
 [audit ui-display]
 
-Run:  runtime\\python.exe tests\\test_esc_order.py
+Run:  python3 tests\\test_esc_order.py
 """
 import os
 import sys

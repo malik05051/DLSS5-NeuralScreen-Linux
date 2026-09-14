@@ -16,7 +16,6 @@ not one.
 """
 from __future__ import annotations
 
-import ctypes
 import queue
 import sys
 import threading
@@ -32,6 +31,7 @@ import pipeline
 import settings_io
 from hotkeys import build_bindings, parse_binding
 from i18n import STRINGS as UI_STRINGS
+import paths
 from paths import BASE_DIR
 from pipeline import restart_worker
 from recorder import VideoRecorder
@@ -39,7 +39,7 @@ from settings_io import (CHANNEL_URL, PROFILES, REPO_URL,
                          WORK_SCALE_MIN, WORK_SCALE_STEP,
                          _autostart_enabled, _next_preset_name,
                          _set_autostart, _work_size, hotkey_labels)
-from winapi import window_frame_rect, window_under_cursor
+from toplevels import window_frame_rect, window_under_cursor
 
 
 def save_screenshot(st, path: Path, rgba) -> None:
@@ -83,7 +83,6 @@ def open_save_dialog(st) -> None:
     if st.shot_dialog_open:
         return
     st.shot_dialog_open = True
-    hwnd = st.display.get_hwnd()
     default_name = f"neuralscreen-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
     shot_dir = st.cfg.get("screenshot_dir")
     initial_dir = str(shot_dir) if isinstance(shot_dir, str) and shot_dir.strip() else None
@@ -91,8 +90,9 @@ def open_save_dialog(st) -> None:
     def _run() -> None:
         try:
             st.shot_paths.put(dialogs.ask_save_path(
-                hwnd, default_name, initial_dir,
-                fallback_dir=BASE_DIR / "screenshots"))
+                default_name, initial_dir,
+                fallback_dir=paths.user_dir("XDG_PICTURES_DIR", "Pictures")
+                / "NeuralScreen"))
         except Exception as exc:
             print(f"[main] the save dialog crashed: {exc}", file=sys.stderr)
             st.shot_paths.put(None)
@@ -275,25 +275,20 @@ def apply_menu_action(st, action: tuple) -> None:
         if new_monitor != st.capture.devicename:
             pipeline.switch_monitor(st, new_monitor)
     elif kind == "window":
-        # The window list in the menu: the value is "hwnd: title".
-        try:
-            target = int(str(action[1]).split(":")[0], 16)
-        except (ValueError, IndexError):
+        # The window list in the menu: the value is "handle\ttitle", and the
+        # handle is opaque - it comes from toplevels.py and means whatever
+        # that module's chosen backend needs it to mean.
+        target = str(action[1]).split("\t", 1)[0].strip()
+        if not target:
             print(f"[main] invalid window: {action[1]!r}", file=sys.stderr)
             return
-        if not ctypes.windll.user32.IsWindow(ctypes.c_void_p(target)):
-            print(f"[main] the window 0x{target:X} is gone", file=sys.stderr)
-            st.display.alert(UI_STRINGS[st.lang]["win_fail"])
-            return
-        # Bring the chosen window to the front: the capture follows
-        # it, and a window buried under others would show through
-        # the overlay as a half-covered picture (user: the chosen
-        # window must come to the foreground, no overlaps).
-        user32 = ctypes.windll.user32
-        user32.BringWindowToTop(ctypes.c_void_p(target))
-        user32.SetForegroundWindow(ctypes.c_void_p(target))
-        print(f"[main] window mode on from the menu - target hwnd "
-              f"0x{target:X}")
+        # The Windows path raised the chosen window to the front here, so
+        # the capture would not show it half-covered by whatever was on top
+        # of it. Neither half of that applies: a Wayland client cannot raise
+        # another client's window, and a per-window capture is not affected
+        # by what is drawn over the window anyway - the compositor renders
+        # the window's own content, not the screen region it occupies.
+        print(f"[main] window mode on from the menu - target {target}")
         pipeline.switch_window(st, target)
     elif kind == "button":
         name = action[1]
@@ -328,14 +323,13 @@ def apply_menu_action(st, action: tuple) -> None:
             if st.shot_dialog_open:
                 return
             st.shot_dialog_open = True
-            hwnd = st.display.get_hwnd()  # captured here: pygame is not thread-safe
 
             def _pick_dir() -> None:
                 # The picker blocks its thread; the answer
                 # (or None on cancel) goes back through the
                 # queue the main loop drains.
                 st.shot_paths.put(dialogs.pick_directory(
-                    hwnd, "Select the screenshot folder"))
+                    "Select the screenshot folder"))
 
             threading.Thread(target=_pick_dir, name="folder-picker",
                              daemon=True).start()
@@ -431,12 +425,17 @@ def drain_commands(st) -> bool:
                     # does not have to hunt for the pointer (user
                     # request). The layout must be current for the
                     # title rect to be valid.
+                    # The Windows build warped the pointer onto the menu's
+                    # title bar here, so the user did not have to hunt for
+                    # it. There is no SetCursorPos on Wayland and there is
+                    # not going to be one: a client moving the pointer is
+                    # how a malicious client would steal a click. The menu
+                    # opens where the user left it instead, which is the
+                    # part of that request that survives.
                     try:
                         st.display.menu.layout(
                             st.display.screen.get_width(),
                             st.display.screen.get_height())
-                        cx, cy = st.display.menu.title_center()
-                        ctypes.windll.user32.SetCursorPos(cx, cy)
                     except Exception:
                         pass
                 else:
@@ -531,20 +530,18 @@ def drain_commands(st) -> bool:
                     st.display.alert(UI_STRINGS[st.lang]["record_off"])
                     st.recorder = None
             elif cmd == "window_mode":
-                # The window under the cursor wins: it works on the
-                # desktop too (the focused window there is Progman,
-                # which is not capturable), and it is what the user
-                # is looking at. Fall back to the last focused
-                # foreign window when the cursor is over nothing
-                # capturable (our own overlay, the desktop).
+                # The window under the cursor wins, where the compositor
+                # will say which one that is - sway and Hyprland do. On
+                # every other compositor there is no such question to ask,
+                # and switch_window falls through to the portal's own
+                # window picker, which is one click and needs no privilege.
                 if st.window_hwnd is not None:
                     print("[main] window mode off - back to the whole screen")
                     pipeline.switch_window(st, 0)
                 else:
                     target = window_under_cursor() or st.last_foreground
                     if target:
-                        print(f"[main] window mode on - target hwnd "
-                              f"0x{target:X}")
+                        print(f"[main] window mode on - target {target}")
                         pipeline.switch_window(st, target)
                     else:
                         # Nothing but our own windows has had the

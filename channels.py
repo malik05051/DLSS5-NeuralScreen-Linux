@@ -6,8 +6,8 @@ None of them is fatal: the pipeline has a slower path for each one and says
 so in the log.
 
     present    the worker shows the frame in its own window (WNDO)
-    dda        the worker captures the screen itself (DDA1)
-    wgc        the worker captures ONE window (WGCW)
+    dda        the worker reads the granted screen stream itself (DDA1)
+    wgc        the worker reads a granted WINDOW stream (WGCW)
     gray       the worker writes luminance back for the flow guides (GRAY)
     motion     the motion field travels at flow size, upscaled on the GPU
     out_shm    the result pixels come back through a section, not the pipe
@@ -22,7 +22,6 @@ functions are for.
 """
 from __future__ import annotations
 
-import ctypes
 import sys
 
 from i18n import STRINGS as UI_STRINGS
@@ -135,16 +134,17 @@ def enable_dda(st) -> None:
     """Ask the worker to capture the screen itself (DDA1).
 
     While it is active FRM1 frames carry FRAME_FLAG_NO_COLOR - no
-    colour goes down the pipe, the worker takes it from Desktop
-    Duplication straight on the GPU. Together with DDA we activate
-    the reverse gray channel: the worker writes luminance there (the
-    flow field size), guides read it and no longer depend on dxcam.
-    A refusal is not fatal: we stay on sending frames from Python.
+    colour goes down the pipe, the worker imports the PipeWire buffer
+    straight into Vulkan. Together with DDA we activate the reverse gray
+    channel: the worker writes luminance there (the flow field size), and
+    guides read it instead of needing a second copy of the screen in
+    Python. A refusal is not fatal: we stay on sending frames from Python.
     """
     st.dda_attempted = True
     try:
-        # In DDA mode guides still need the frame (motion), so dxcam
-        # keeps running - we simply stop sending colour to the worker.
+        # In DDA mode guides still need a frame for the motion field, so
+        # the Python-side capture keeps running when there is one - we
+        # simply stop sending colour to the worker.
         send_dda(st.worker, st.width, st.height, 0)
         st.reader.wait_dack(timeout=15.0)
         st.dda_mode = True
@@ -155,11 +155,12 @@ def enable_dda(st) -> None:
         st.dda_mode = False
         print(f"[main] capture inside the worker unavailable ({exc}) - frames through Python",
               file=sys.stderr)
-        # The chosen card could not open a capture session - it drives no
-        # display. The pipeline is SPLIT now: the network runs on the chosen
-        # card while the capture stays on the display card and every frame
-        # crosses through shared memory. In issue #29 exactly this happened
-        # after a GPU switch and nothing on the screen said so.
+        # The chosen card could not import the stream's buffers - it is not
+        # the card the compositor composes on. The pipeline is SPLIT now:
+        # the network runs on the chosen card while the frames arrive from
+        # the other one and cross through shared memory. On Windows this was
+        # a capture session the card refused (issue #29); here it is a dmabuf
+        # it cannot import, and either way nothing on the screen said so.
         if st.gpu_switch_pending:
             st.gpu_switch_pending = False
             st.display.alert(UI_STRINGS[st.lang].get(
@@ -170,11 +171,10 @@ def enable_wgc(st) -> bool:
     """Ask the worker to capture the target WINDOW (WGCW).
 
     The same deal as DDA1 - the colour stops going down the pipe and the
-    reverse gray channel feeds the guides - except the source is one window,
-    which is why the overlay does not have to hide from screen capture.
+    reverse gray channel feeds the guides - except the source is one window.
 
-    False means the window is not usable any more: closed, minimised, or the
-    worker refused it. Rebuilding the pipeline for the whole screen is the
+    False means the stream is not usable any more: the window was closed,
+    the user revoked the grant, or the worker refused it. Rebuilding the pipeline for the whole screen is the
     caller's business - this module opens channels, it does not decide what
     the program shows, and that callback into the pipeline was the one thing
     keeping this code inside main().
@@ -182,10 +182,10 @@ def enable_wgc(st) -> bool:
     st.dda_attempted = True
     if st.window_hwnd is None:
         return True
-    if not ctypes.windll.user32.IsWindow(st.window_hwnd):
-        print("[main] the captured window is gone - back to full screen",
-              file=sys.stderr)
-        return False
+    # There is no "is this window still alive" call to make: a Wayland
+    # client cannot ask about another client. The compositor answers by
+    # ending the stream, which the worker reports as a refusal below - so
+    # the check that used to be here is simply the error path now.
     try:
         send_wgc(st.worker, st.window_hwnd)
         aw, ah = st.reader.wait_wgak(timeout=15.0)
@@ -221,11 +221,11 @@ def forget_out(st) -> None:
     st.out_attempted = False
 
 
-def probe_window_capture(st, hwnd: int) -> tuple:
-    """Ask the CURRENT worker for the capture size of a window.
+def probe_window_capture(st, node: int) -> tuple:
+    """Ask the CURRENT worker for the capture size of a window stream.
 
     It switches that worker's source as a side effect, which is
     harmless: the caller tears it down immediately afterwards.
     """
-    send_wgc(st.worker, hwnd)
+    send_wgc(st.worker, node)
     return st.reader.wait_wgak(timeout=15.0)

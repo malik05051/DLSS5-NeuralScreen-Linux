@@ -11,7 +11,7 @@ itself "succeeds".
 Expected: after apply_menu_action(("button", "save_preset")) the re-read
 file carries the preset, and Delete removes it from the file. [audit F1]
 
-Run:  runtime\\python.exe tests\\test_preset_roundtrip.py
+Run:  python3 tests\\test_preset_roundtrip.py
 """
 import json
 import shutil

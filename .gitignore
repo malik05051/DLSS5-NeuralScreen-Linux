@@ -5,24 +5,23 @@ _work/
 __pycache__/
 *.pyc
 
-# Build artefacts (native/build-host.bat, native/build-launcher.bat)
-*.obj
-native/nvngx.dll
-native/nvngx.dll.manifest
-native/nvngx.dll_ns-forwarder.dll
-native/nvngx.dll_ns-forwarder.exp
-native/nvngx.dll_ns-forwarder.lib
-native/launcher.res
-NeuralScreen.exe
+# Build artefacts (native/linux/build-host.sh)
+*.o
+native/linux/neuralscreen-host
+native/linux/NeuralScreen-host.log
+
+# The generated layer-shell bindings, when they are cached in-tree rather
+# than under ~/.cache (see wlproto.py)
+native/protocols/_generated/
 
 # NVIDIA redistributable: 165 MB, over the GitHub file limit (100 MB).
 # How to get it - see README.md, the Requirements section.
-native/nvngx_dlssnr.dll
+native/nvngx_dlssnr.so
 
 # Optional local Python runtime next to the program
 runtime/
 
-# Program log (pythonw launch without a console)
+# Program log (no terminal when launched from the desktop entry)
 NeuralScreen.log
 
 # Recordings made with Num0
@@ -30,6 +29,7 @@ recordings/
 
 # Release archives in the root (rebuilt at release time)
 *.zip
+*.tar.xz
 
 # Screenshots taken with the menu button
 screenshots/

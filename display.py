@@ -1,13 +1,19 @@
 """Display module for the DLSS 5 Desktop NR prototype.
 
-Borderless fullscreen window for the frame + the in-overlay settings
-menu. The window is hidden at creation and revealed on the first real
-frame (no blank flash at launch); it is excluded from screen capture
-via SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) so that
-screen-capture tools (dxcam, OBS) do not see it. Mode switches (Num5,
-monitor change) are covered by a semi-transparent veil (a blur of the
-last frame) with an assembling mark (enter_switch_mode /
-exit_switch_mode).
+A Wayland layer surface for the frame + the in-overlay settings menu.
+Nothing is attached to it until the first real frame arrives, so there is
+no blank flash at launch. Mode switches (Num5, monitor change) are covered
+by a semi-transparent veil (a blur of the last frame) with an assembling
+mark (enter_switch_mode / exit_switch_mode).
+
+pygame is still the renderer and every pixel of the menu is drawn by
+overlay_ui.py exactly as before - what changed is where the pixels go.
+SDL never opens a window here: the video driver is the dummy one, the
+frame is drawn into an offscreen Surface, and wayland_shell puts that
+surface on the screen as a layer-shell overlay. All the Win32 window
+plumbing this module used to carry - topmost, layered, click-through,
+capture affinity, DPI awareness - is either one protocol request in
+wayland_shell or gone, because Wayland has no such concept.
 
 Usage:
     disp = Display(2560, 1440)
@@ -24,89 +30,66 @@ Usage:
 
 from __future__ import annotations
 
-import ctypes
 import math
 import os
-import struct
 import sys
 import time
-from ctypes import wintypes
 from typing import Dict, List
 
-# --- argtypes for user32: WITHOUT them ctypes passes ints as a 32-bit c_int.
-# HWND_TOPMOST=-1 turns into 0xFFFFFFFF instead of 0xFFFFFFFFFFFFFFFF and
-# SetWindowPos silently FAILS (ret=0) on 64-bit Windows - topmost is not
-# applied. hwnd (64-bit) would also be truncated at values >= 2^31.
-user32 = ctypes.windll.user32
-user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
-                                ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
-user32.SetWindowPos.restype = wintypes.BOOL
-user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
-user32.FindWindowW.restype = wintypes.HWND
-user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetWindowLongW.restype = wintypes.LONG
-user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
-user32.SetWindowLongW.restype = wintypes.LONG
-user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF,
-                                              wintypes.BYTE, wintypes.DWORD]
-user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
-user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
-user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+# SDL must not open a window: the overlay is a Wayland layer surface that
+# wayland_shell owns, and an SDL window next to it would be a second,
+# visible, focusable copy of the program. The dummy driver gives pygame its
+# font, image and event machinery with no window at all. Set before pygame
+# is imported - SDL reads the driver once, at init.
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+# And no audio device either: pygame.init() opens one by default, and on a
+# machine with no sound card that is several lines of ALSA complaint in the
+# log before the program has done anything. The recorder talks to PipeWire
+# directly (audio.py) and never goes through SDL.
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
+class _Rect:
+    """left/top/right/bottom, the way the highlight code reads a rectangle.
 
-class CURSORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
-                ("hCursor", wintypes.HANDLE), ("ptScreenPos", wintypes.POINT)]
+    It used to be a wintypes.RECT filled by GetWindowRect. The compositor
+    answers in (x, y, w, h) instead, and this keeps the drawing code that
+    consumes it unchanged rather than rewriting arithmetic that was already
+    right.
+    """
 
+    __slots__ = ("left", "top", "right", "bottom")
 
-CURSOR_SHOWING = 0x00000001
+    def __init__(self, left: int, top: int, right: int, bottom: int):
+        self.left, self.top = int(left), int(top)
+        self.right, self.bottom = int(right), int(bottom)
 
 
 def system_cursor_visible() -> bool:
-    """Is there a mouse pointer on screen right now? (Nothing uses this yet.)
+    """Is there a mouse pointer on screen right now? Always True here.
 
-    Kept for the open problem it belongs to: a fullscreen game hides the
-    cursor and our menu is then unusable. Drawing our own pointer was tried
-    and reverted - it produced a SECOND pointer in real use, which is worse
-    than none. See "The menu pointer is missing or frozen" in the README.
+    This existed for a problem Wayland does not have. On Windows a
+    fullscreen game hid the system cursor on its own input queue and it
+    stayed hidden over our menu, so the overlay had to consider drawing its
+    own - which was tried, and produced a SECOND pointer on a normal
+    desktop, which is worse than none.
 
-    A fullscreen game hides it (ShowCursor(FALSE) on its own input queue) and
-    it stays hidden while our menu is up. When it is gone the overlay draws
-    its own; when it is there, drawing one would mean two pointers.
-
-    Unknown counts as visible: a missing answer must not put a second pointer
-    on a normal desktop.
+    Here the compositor owns the pointer, and every surface says what it
+    should look like while the pointer is over it: wayland_shell sets the
+    default shape when the menu takes input and hides it while the overlay
+    is click-through. There is no hidden state to guess at, so the answer
+    is an honest constant and the callers keep working unchanged.
     """
-    ci = CURSORINFO()
-    ci.cbSize = ctypes.sizeof(CURSORINFO)
-    try:
-        if not user32.GetCursorInfo(ctypes.byref(ci)):
-            return True
-    except Exception:
-        return True
-    return bool(ci.flags & CURSOR_SHOWING)
+    return True
 
-# DPI-aware BEFORE import pygame: on load SDL freezes the process awareness,
-# and a later SetProcessDpiAwarenessContext no longer takes effect (it returns
-# an error). Without this Windows scales the window: 125% -> 3072x1728 instead
-# of 3840x2160 and the frame no longer matches the screen. Verified by
-# diagnostics.
-try:
-    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))  # PER_MONITOR_AWARE_V2
-except Exception:
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()
-        except Exception:
-            pass
 
 import numpy as np
 import pygame
 
 import fonts
+import toplevels
+import wayland_shell
 from overlay_ui import OverlayMenu, palette as ui_palette
+from wayland_shell import SHELL, Overlay, make_surface
 
 from i18n import STRINGS
 
@@ -122,14 +105,15 @@ SWITCH_ALPHA = 170                 # mode-switch overlay: the live desktop shows
 # animated by the loop. Seconds.
 SWITCH_FADE_IN = 0.21
 SWITCH_FADE_OUT = 0.26
-WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
-# Chroma key for HUD mode: pixels of exactly this colour are not drawn at all
-# by the layered window, and the worker's overlay shows through them. Picked so
-# it cannot occur in the HUD palette (#0D1117 / #FFBF00 / #E6EDF3 / #8B949E).
-CHROMA_KEY = (0xFF, 0x00, 0xFF)
-LWA_COLORKEY = 0x1
-LWA_ALPHA = 0x2
+# HUD mode used to be a chroma key: the layered window drew its background
+# in one magenta and Windows punched exactly that colour out, because a
+# layered window has one global alpha and no per-pixel one. A Wayland
+# surface has per-pixel alpha, so the hole is simply alpha 0 - no key
+# colour, no chance of a HUD element happening to be exactly magenta, and
+# no pink fringe where a blended pixel missed the key by one.
+TRANSPARENT = (0, 0, 0, 0)
+CHROMA_KEY = TRANSPARENT     # the old name, for the call sites that fill
 
 # Which faces the program draws with lives in fonts.py - including the
 # per-script CJK families, re-exported here because the docs renderer and
@@ -225,75 +209,36 @@ def _assemble_tiles(t: float, w: int, h: int) -> list:
 class Display:
     """Fullscreen borderless window that renders frames + branded HUD."""
 
-    def __init__(self, width: int, height: int, fullscreen: bool = True, click_through: bool = True):
-        # DPI awareness is already set at module level (before import pygame).
-        # Calling it again here has no effect - it is kept as a fallback for
-        # cases where the module is imported without the top block.
-        try:
-            ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
-        except Exception:
-            pass
-        # SDL hints BEFORE pygame.init():
-        # SDL_WINDOWS_DPI_AWARENESS=permonitorv2 - without it Windows scales
-        # the window (125% -> 3072x1728 instead of 3840x2160).
-        # SDL_MOUSE_FOCUS_CLICKTHROUGH=1 - a click on the window is not
-        # intercepted by SDL (the window is not activated, focus is not taken
-        # away), so clicks reach the applications underneath the overlay.
-        try:
-            os.environ["SDL_WINDOWS_DPI_AWARENESS"] = "permonitorv2"
-        except Exception:
-            pass
-        try:
-            os.environ["SDL_MOUSE_FOCUS_CLICKTHROUGH"] = "1"
-        except Exception:
-            pass
+    def __init__(self, width: int, height: int, fullscreen: bool = True,
+                 click_through: bool = True, output_name: str = ""):
         pygame.init()
-        pygame.display.set_caption("NeuralScreen")
-        # Borderless windowed instead of FULLSCREEN: a pygame fullscreen window
-        # loses its rendering on click/focus (the screen freezes while the loop
-        # keeps spinning). A window the size of the monitor at position (0,0)
-        # looks the same but is stable, and click-through works.
-        flags = pygame.NOFRAME
-        self._flags = flags
-        # pygame.HIDDEN (128, SDL_WINDOW_HIDDEN): create the window invisible.
-        # NOTE: the raw SDL flag 0x8 is IGNORED by pygame 2.6 (verified
-        # experimentally) - the window comes up visible. pygame.HIDDEN works;
-        # the explicit SW_HIDE below is a belt-and-suspenders fallback. Shown
-        # only once the first real frame arrives - otherwise a blank window
-        # sits over the desktop during the NGX warm-up (user: screen flashes
-        # on startup / on mode switches because a new window pops up empty).
-        hidden = pygame.NOFRAME | pygame.HIDDEN
-        self.screen = pygame.display.set_mode((width, height), hidden)
+        if not SHELL.connect():
+            raise RuntimeError(
+                "no Wayland compositor to put the overlay on - this build "
+                "needs a Wayland session (WAYLAND_DISPLAY)")
+        # The frame is drawn into an ordinary offscreen Surface, laid out in
+        # the channel order the compositor reads, so handing it over is a
+        # memcpy rather than a conversion of 33 MB per 4K frame.
+        self.screen = make_surface(width, height)
         self.width, self.height = self.screen.get_size()
-        # The window starts hidden; reveal() shows it after the first real
-        # frame. set_visible/is_visible interplay: is_visible() is consulted
-        # by _follow_window before any show/hide decision, so the initial
-        # state must match the real (hidden) window.
+        self._flags = 0        # kept: callers read it, nothing sets it now
+        output = SHELL.output_by_name(output_name) if output_name else None
+        if output is None:
+            outputs = SHELL.output_list()
+            output = outputs[0] if outputs else None
+        self._overlay = Overlay(SHELL, self.width, self.height, output,
+                                click_through=click_through)
+        # Nothing is attached to the surface until the first real frame, so
+        # the overlay is simply not drawn during the NGX warm-up. The
+        # Windows build had to create the window hidden and reveal it; here
+        # "hidden" is the natural state of a surface with no buffer.
         self._visible = False
         self._reveal_pending = True
-        # pygame 2.6 ignores SDL_WINDOW_HIDDEN (verified experimentally: the
-        # window is VISIBLE right after set_mode with the 0x8 flag) - hide it
-        # explicitly or a blank window flashes over the desktop during the
-        # NGX warm-up (user: translucent/blank flash on startup).
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
-        except Exception:
-            pass
-        # Where this monitor's top-left corner is on the virtual desktop.
-        # (0,0) is the primary monitor; a second one can sit anywhere. Set
-        # through set_origin() once the monitor is known (main owns that).
-        self._origin = (0, 0)
-        self._move_to_origin()
-        # Force the physical window size: even if DPI awareness did not apply
-        # (a 3072x1728 window instead of 3840x2160), we stretch the window to
-        # the requested size so the pygame surface matches.
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, width, height, 0x0004)  # SWP_NOZORDER
-        except Exception:
-            pass
-        self._set_topmost()
+        # Where this monitor's top-left corner is, in the compositor's
+        # logical coordinates. The layer surface is anchored to the output
+        # itself, so this is only needed to translate a captured window's
+        # position into overlay-local pixels.
+        self._origin = (output.x, output.y) if output is not None else (0, 0)
         self.clock = pygame.time.Clock()
         self._hud: Dict = {}
         self._alerts: List[tuple[str, float]] = []  # (text, expires_at)
@@ -321,18 +266,19 @@ class Display:
         self._font = self._load_font(size=self.font_size, mono=True)
         self._alert_font = self._load_font(
             size=max(10, int(round(ALERT_FONT_SIZE * self.ui_scale))))
-        # Disable vsync: flip() must not wait for vblank (otherwise the FPS is
-        # tied to the monitor refresh rate and frames are lost on a slow
-        # pipeline).
-        try:
-            pygame.display.set_swap_interval(0)
-        except Exception:
-            pass
-        self._excluded = self._exclude_from_capture()
-        self._click_through = False
+        # There is no vsync to disable: a wl_surface commit is not a
+        # buffer swap and never blocks on vblank. The compositor releases
+        # buffers when it is done with them and present() drops a frame
+        # rather than wait, which is the same policy the swap-interval-0
+        # flip had and is enforced by the buffer pool instead of by a hint.
+        self._excluded = False
+        self._click_through = click_through
         self._menu_input = False
-        if click_through:
-            self._set_click_through()
+        #: The layer's global translucency, 0-255, folded into the alpha
+        #: channel at present time. It stands in for the layered window's
+        #: LWA_ALPHA, which was the only way Windows could make a whole
+        #: window see-through.
+        self._layer_alpha = 255
         # NOTE: _visible/_reveal_pending are set right after set_mode - the
         # window starts hidden and reveal() shows it after the first frame.
         # HUD mode: the worker draws the frame, the window shows only the HUD
@@ -366,18 +312,21 @@ class Display:
     def _sync_cursor(self) -> None:
         """Cursor over the menu area: move and resize arrows.
 
-        Set only on change - calling set_cursor every frame makes the cursor
-        flicker noticeably.
+        Set only on change - asking for a shape every frame is a request per
+        frame for a pointer that did not move.
+
+        SDL is not running a window, so pygame.mouse.set_cursor has nothing
+        to set. The shape goes to the compositor through the cursor-shape
+        protocol instead, which is also the only thing that works over a
+        fullscreen game: the pointer belongs to the compositor, and a client
+        says what it should look like rather than drawing one.
         """
         want = (self.menu.desired_cursor if self.menu.visible
                 else pygame.SYSTEM_CURSOR_ARROW)
         if want == getattr(self, "_cursor", None):
             return
         self._cursor = want
-        try:
-            pygame.mouse.set_cursor(want)
-        except Exception:
-            pass
+        self._overlay.set_cursor_shape(want)
 
     @property
     def theme(self) -> dict:
@@ -385,11 +334,14 @@ class Display:
         return ui_palette(self.menu.state.get("theme", "light"))
 
     def get_hwnd(self) -> int:
-        """HWND of the overlay window - the parent for native dialogs."""
-        try:
-            return int(pygame.display.get_wm_info()["window"])
-        except Exception:
-            return 0
+        """There is no window handle. 0, and every caller checks for it.
+
+        It existed to parent the native Save As dialog. The portal draws
+        that dialog in its own process and takes no parent, so the value
+        has nothing left to mean - kept as a constant rather than removed
+        so a stale caller fails visibly instead of raising AttributeError.
+        """
+        return 0
 
     @staticmethod
     def _rgb(color: str) -> tuple[int, int, int]:
@@ -410,37 +362,32 @@ class Display:
                 size=max(10, int(round(ALERT_FONT_SIZE * self.ui_scale))))
 
     def set_visible(self, visible: bool) -> None:
-        """Show/hide the window (SW_SHOW/SW_HIDE).
+        """Show or hide the overlay.
 
-        With NR OFF the window is hidden completely so the desktop does not
-        slow down (no capture/blit/flip). With NR ON it is shown again.
+        With NR OFF the overlay is hidden completely so the desktop does not
+        pay for a capture, a blit and a commit it cannot see. Hiding is
+        attaching no buffer: the surface, its size, its output and its role
+        all stay, which is why a mode switch no longer costs a window
+        recreation the way it did on Windows.
         """
         if visible and self._reveal_pending:
-            # The first frame has not arrived yet (the window is hidden on
-            # purpose - SDL_WINDOW_HIDDEN at creation to avoid the blank
-            # flash). _follow_window would happily show it early; only
-            # reveal() may show the window for the first time.
+            # The first frame has not arrived yet. _follow_window would
+            # happily show the overlay early; only reveal() may show it for
+            # the first time.
             return
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            user32.ShowWindow(hwnd, 5 if visible else 0)  # SW_SHOW=5, SW_HIDE=0
-            self._visible = visible
-        except Exception:
-            pass
+        self._overlay.set_visible(visible)
+        self._visible = visible
 
     def reveal(self) -> None:
-        """Show the window once a real frame has arrived.
+        """Show the overlay once a real frame has arrived.
 
-        The window is created hidden (SDL_WINDOW_HIDDEN) to avoid a blank
-        flash over the desktop during the NGX warm-up. Called after the
-        first successful frame exchange in main; idempotent - after the
-        first call the window is simply visible and the mode switches go
-        through set_visible() (which hides it for minimised windows etc).
+        Called after the first successful frame exchange in main;
+        idempotent - after the first call the overlay is simply visible and
+        the mode switches go through set_visible().
         """
         if self._reveal_pending:
             try:
-                hwnd = pygame.display.get_wm_info()["window"]
-                user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                self._overlay.set_visible(True)
                 self._visible = True
             finally:
                 self._reveal_pending = False
@@ -449,67 +396,46 @@ class Display:
         return getattr(self, "_visible", True)
 
     def _set_topmost(self) -> None:
-        """HWND_TOPMOST - the window always sits above the rest (overlay)."""
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0,
-                                              0x0001 | 0x0002)  # SWP_NOSIZE|NOMOVE
-        except Exception:
-            pass
+        """Nothing to do: the layer surface is on the overlay layer.
+
+        HWND_TOPMOST was a property of a window that other windows could
+        take away by also asking for it, which is why the Windows build
+        re-asserted it every thirty frames. A layer surface on the overlay
+        layer is above every ordinary surface by protocol; there is no race
+        to win and nothing to reassert.
+        """
 
     def move_to(self, x: int, y: int) -> None:
-        """Put the overlay's top-left corner at (x, y) on the desktop.
+        """Remember where the captured window is, for the frame blit.
 
-        The one-window mode needs it: the overlay is the size of the window
-        being processed and has to sit exactly on it. Topmost is reasserted on
-        the way (the insert-after argument), so a game raising itself does not
-        end up above the HUD.
+        The layer covers the whole output, so it does not travel with the
+        window - it only has to know where the window is so the frame lands
+        on it. Following a window's *position* additionally needs the
+        compositor to say where the window is; see toplevels.py, which can
+        on sway and Hyprland and cannot elsewhere.
         """
-        # The layer covers the screen, so it does not travel with the window
-        # any anymore - it only has to remember where the window is, for the
-        # frame blit when the worker is not presenting. This used to be a
-        # SetWindowPos on every frame the target moved.
         self._window_layer = (int(x), int(y),
                               self._frame_size[0] if self._frame_size else 0,
                               self._frame_size[1] if self._frame_size else 0)
-        screen = self._screen_rect()
-        if screen is not None and (self.width, self.height) == (screen[2], screen[3]):
-            return
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            # SWP_NOSIZE | SWP_NOACTIVATE - move only, never take the focus.
-            user32.SetWindowPos(hwnd, -1, int(x), int(y), 0, 0, 0x0001 | 0x0010)
-        except Exception as exc:
-            print(f"Display: WARNING could not move the overlay: {exc}")
 
     def set_origin(self, x: int, y: int) -> None:
-        """Where this monitor's top-left corner sits on the virtual desktop.
+        """Where this monitor's top-left corner sits in the compositor's
+        logical coordinate space.
 
-        The overlay is the size of ONE monitor; only the primary has its
-        corner at (0,0). A window created at (0,0) while the capture runs
-        on a second monitor covers the PRIMARY screen - the user sees
-        nothing where they are looking (issues #28, #33).
+        The overlay is anchored to one output and is that output's size, so
+        unlike the Windows build it cannot land on the wrong monitor
+        (issues #28, #33 cannot recur). The origin is still needed to turn
+        a captured window's absolute position into overlay-local pixels.
         """
         self._origin = (int(x), int(y))
-        self._move_to_origin()
 
-    def _move_to_origin(self) -> None:
-        """Move the window to the monitor's top-left corner (self._origin)."""
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            x, y = getattr(self, "_origin", (0, 0))
-            # NO SWP_SHOWWINDOW here: the window is created hidden
-            # (SDL_WINDOW_HIDDEN) and revealed only after the first real
-            # frame - otherwise the blank window flashes over the desktop
-            # during the NGX warm-up.
-            flags = 0x0001 | 0x0010  # SWP_NOSIZE | SWP_NOACTIVATE
-            if (x, y) == (0, 0):
-                # The primary monitor: SDL already placed it there, and the
-                # pre-multi-monitor behaviour (no move at all) stays intact.
-                flags |= 0x0002  # SWP_NOMOVE
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, 0, 0, flags)
-        except Exception:
-            pass
+    def set_output(self, output_name: str) -> None:
+        """Move the overlay to another monitor, by connector name."""
+        output = SHELL.output_by_name(output_name)
+        if output is None:
+            return
+        self._overlay.set_output(output)
+        self._origin = (output.x, output.y)
 
     # -- window plumbing --------------------------------------------------
 
@@ -520,163 +446,87 @@ class Display:
                           lang=getattr(self, "_lang", "en"))
 
     def _set_click_through(self) -> bool:
-        """Click-through: WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_LAYERED.
+        """Click-through: an empty input region on the surface.
 
-        Verified by diagnostics (_work/diag_click.py, Win11 4K): WS_EX_TRANSPARENT
-        WITHOUT WS_EX_LAYERED does NOT work - WindowFromPoint still returns the
-        overlay and the click goes to the overlay. The working combination (per
-        MSDN "Layered Windows"): a layered window + WS_EX_TRANSPARENT -> hit
-        testing ignores the window shape and clicks go to the window under the
-        cursor.
+        On Windows this was WS_EX_TRANSPARENT, which only worked in
+        combination with WS_EX_LAYERED and a SetLayeredWindowAttributes
+        call to activate it, and needed SWP_FRAMECHANGED afterwards to drop
+        the style cache - three calls in a mandatory order, arrived at by
+        diagnostics. Wayland has one request for it and it means exactly
+        this: the surface accepts input nowhere, so every click lands on
+        whatever is underneath.
 
-        The order is mandatory:
-          1. SetWindowLongW(GWL_EXSTYLE, ... | WS_EX_LAYERED | WS_EX_TRANSPARENT
-             | WS_EX_NOACTIVATE)
-          2. SetLayeredWindowAttributes(alpha=255, LWA_ALPHA) - activates
-             layered mode (without the call the window stays ordinary: the
-             LAYERED flag is in exstyle but hit testing does not change)
-          3. SetWindowPos(SWP_FRAMECHANGED) - drops the window style cache
-             (required by the SetWindowLongW documentation)
-        WS_EX_NOACTIVATE: the window does not take focus, the keyboard stays
-        with the active application. Control is via global hotkeys
-        (GetAsyncKeyState in main.py).
+        WS_EX_NOACTIVATE has a counterpart too and it is set separately:
+        keyboard_interactivity none, in set_menu_input.
         """
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            GWL_EXSTYLE = -20
-            WS_EX_TRANSPARENT = 0x00000020
-            WS_EX_NOACTIVATE = 0x08000000
-            WS_EX_LAYERED = 0x00080000
-            WS_EX_TOOLWINDOW = 0x00000080
-            LWA_ALPHA = 0x2
-            SWP_NOMOVE = 0x0002
-            SWP_NOSIZE = 0x0001
-            SWP_NOZORDER = 0x0004
-            SWP_FRAMECHANGED = 0x0020
-            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                                  style | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
-                                  | WS_EX_LAYERED | WS_EX_TOOLWINDOW)
-            # Activate layered mode: alpha=255 (an opaque window, only hit
-            # testing changes, visually we touch nothing)
-            user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
-            # Drop the style cache - without SWP_FRAMECHANGED the
-            # SetWindowLongW changes may not take effect
-            user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
-            self._click_through = True
-            return True
-        except Exception as exc:
-            print(f"Display: WARNING click-through failed: {exc}")
-            return False
+        self._overlay.set_click_through(True)
+        self._click_through = True
+        return True
 
     def _exclude_from_capture(self) -> bool:
-        """SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) on the window.
-
-        Makes the window invisible to screen capture (dxcam, OBS, etc.).
-        Best-effort: warn on failure, never crash.
-        """
+        """Nothing to do, and nothing lost. See set_excluded_from_capture."""
         return self.set_excluded_from_capture(True)
 
     def set_excluded_from_capture(self, hide: bool) -> bool:
-        """Hide the overlay from screen capture, or stop hiding it.
+        """A no-op here, because the problem it solved cannot occur.
 
-        Hiding is mandatory while the input is Desktop Duplication of the whole
-        screen: without it the pipeline would capture its own output. With one
-        window as the input there is no such loop, and then hiding is pure
-        loss - it is what stops OBS from seeing the overlay and stops the
-        NVIDIA App from recording at all.
+        WDA_EXCLUDEFROMCAPTURE existed for one reason: Desktop Duplication
+        captured the whole composited screen, our overlay included, so the
+        pipeline would have fed its own output back into itself. The portal
+        does not work that way - it grants one source, and the compositor
+        composes that source without us in it when we are a layer surface
+        on top of it rather than a window inside it.
+
+        The Windows flag also had a cost the README had to explain: it hid
+        the overlay from OBS and stopped the NVIDIA App recording
+        altogether, so one-window mode had to drop it. That trade is gone
+        with the flag - an external recorder capturing the same output sees
+        exactly what the user sees.
+
+        Returns True so the callers' logging stays truthful about the state
+        they asked for.
         """
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            user32 = ctypes.windll.user32
-            want = WDA_EXCLUDEFROMCAPTURE if hide else 0  # 0 = WDA_NONE
-            ok = user32.SetWindowDisplayAffinity(hwnd, want)
-            if not ok:
-                print(f"Display: WARNING SetWindowDisplayAffinity({want}) failed "
-                      f"(the overlay may be visible to screen capture)")
-                return False
-            self._excluded = bool(hide)
-            return True
-        except Exception as exc:
-            print(f"Display: WARNING cannot change the capture affinity: {exc}")
-            return False
+        self._excluded = bool(hide)
+        return True
 
     # -- public API -------------------------------------------------------
 
     def set_menu_input(self, enabled: bool) -> None:
         """Whether input should reach our layer (while the menu is open).
 
-        Normally the window is click-through: WS_EX_TRANSPARENT gives clicks to
-        whatever is underneath. While the menu is up the flag is removed - the
-        clicks are ours and the game under the overlay does not get them.
-        Exactly the ReShade behaviour. WS_EX_NOACTIVATE is removed too,
-        otherwise there is no keyboard.
+        Two requests, matching the two Windows styles this replaces: the
+        input region (WS_EX_TRANSPARENT) decides whether clicks stop here,
+        and the keyboard interactivity (WS_EX_NOACTIVATE) decides whether
+        keys do.
+
+        The focus-stealing dance the Windows build needed - AttachThreadInput
+        around SetForegroundWindow, because the system refuses to give focus
+        to a process the user has not interacted with - has no equivalent
+        and needs none. A layer surface asking for exclusive keyboard
+        interactivity gets the keyboard from the compositor, which is the
+        one party entitled to decide, and gives it back when it stops
+        asking. The game underneath never loses its own focus.
         """
         self._menu_input = bool(enabled)
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-        except Exception as exc:
-            print(f"Display: WARNING no hwnd for menu input: {exc}")
-            return
-        GWL_EXSTYLE = -20
-        WS_EX_TRANSPARENT = 0x00000020
-        WS_EX_NOACTIVATE = 0x08000000
-        WS_EX_TOOLWINDOW = 0x00000080
-        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_FRAMECHANGED = 0x2, 0x1, 0x4, 0x20
-        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        if enabled:
-            style &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE)
-        else:
-            style |= WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
-        # WS_EX_TOOLWINDOW stays on in both states: the overlay is an
-        # instrument window, not an application - it must never create a
-        # second taskbar button / Alt+Tab entry next to the 1x1 APPWINDOW
-        # button (user: two thumbnails in the taskbar, a narrow settings one
-        # and the big overlay one).
-        style |= WS_EX_TOOLWINDOW
-        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
-        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED)
-        if enabled:
-            # Focus is needed for the keyboard. The mouse works without it -
-            # the click goes to the window under the cursor now that it is no
-            # longer transparent. SetForegroundWindow alone is refused when
-            # the foreground window belongs to another process that has not
-            # received input from the user (a game in the foreground): the
-            # system blocks the steal. AttachThreadInput is the standard
-            # workaround - it makes the foreground thread share its input
-            # state with ours, so the activation is treated as user-initiated.
-            try:
-                fg = user32.GetForegroundWindow()
-                fg_tid = user32.GetWindowThreadProcessId(fg, None)
-                my_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-                if fg_tid and fg_tid != my_tid:
-                    user32.AttachThreadInput(my_tid, fg_tid, True)
-                user32.SetForegroundWindow(hwnd)
-                user32.SetActiveWindow(hwnd)
-                user32.SetFocus(hwnd)
-                if fg_tid and fg_tid != my_tid:
-                    user32.AttachThreadInput(my_tid, fg_tid, False)
-            except Exception:
-                pass
+        self._overlay.set_click_through(not enabled)
+        self._overlay.set_keyboard(enabled)
         self._click_through = not enabled
 
     def resize(self, w: int, h: int) -> None:
         """Resize the HUD layer WITHOUT destroying the SDL window.
 
-        pygame.display.set_mode() on the same display reuses the existing
-        window (a soft resize), which is what a one-window mode switch needs:
-        the old code went through display.close() -> pygame.quit() and rebuilt
-        the whole window from scratch - the screen went black for a moment on
-        every Num5 (user: screen flashes on mode switches).
+        The surface is rebuilt at the new size and the layer surface is told
+        the new size; the wl_surface, its role and its output all stay. The
+        Windows path had to go through set_mode, which could recreate the
+        physical window and lose every attribute with it, so the resize
+        ended in four restoring calls - and before that it went through
+        close() and pygame.quit(), which turned the screen black for a
+        moment on every Num5 (user: screen flashes on mode switches).
 
-        set_mode returns a NEW surface - it must become self.screen,
-        otherwise main keeps drawing on the old (window-sized) surface and
-        the layer never actually resizes. set_mode alone does NOT resize the
-        physical window in SDL2, so the caller forces it with SetWindowPos.
-        The recreated window loses EVERYTHING (layered attributes, capture
-        affinity, input styles) - restore them here, once.
+        The new surface must become self.screen: main keeps drawing on
+        whatever this attribute holds, and a stale one means the layer never
+        actually resizes (user: the menu was clipped and could not be
+        dragged above the captured window).
 
         While the mode-switch veil is up the resize is DEFERRED: the
         veil spans the full monitor on purpose (no bare desktop around
@@ -699,15 +549,15 @@ class Display:
         if self._switch_active:
             self._switch_pending = (w, h)
             return
-        self.screen = pygame.display.set_mode((w, h), self._flags)
+        self.screen = make_surface(w, h)
         self.width, self.height = w, h
-        # A set_mode can recreate the physical window; put it back on the
-        # chosen monitor (the origin belongs to the pipeline, not to SDL).
-        self._move_to_origin()
-        self.set_hud_only(self._hud_only, force=True)
-        self.set_menu_opaque(self.menu.visible)
-        self.set_excluded_from_capture(self._excluded)
-        self.set_menu_input(self._menu_input)
+        self._overlay.resize(w, h)
+        # Nothing to re-apply. The Windows path recreated the physical
+        # window here and lost every attribute with it - layered flags,
+        # capture affinity, input styles - which is why this used to end in
+        # four restoring calls. A layer surface survives a resize: the role,
+        # the output, the input region and the keyboard mode are all still
+        # set, and only the buffers are rebuilt.
 
     def set_fullscreen_layer(self, full_w: int, full_h: int) -> None:
         """Expand the HUD layer to the whole screen (menu open in window mode).
@@ -722,32 +572,16 @@ class Display:
 
         While the mode-switch veil is up this is a NO-OP: the layer was
         already expanded to the full screen by enter_switch_mode, and the
-        layering attributes (LWA_COLORKEY/ALPHA) belong to the veil until
-        the teardown re-applies the pipeline's ones - tearing them down
-        mid-veil turns the translucent layer opaque (audit M1).
+        veil owns the layer's translucency until the teardown gives it back
+        (audit M1).
         """
         if self._switch_active:
             return
         try:
-            # set_mode returns a NEW surface - it must become self.screen,
-            # otherwise main keeps drawing the menu on the old (window-sized)
-            # surface and the layer never actually expands (user: the menu
-            # was clipped and could not be dragged above the captured window).
-            self.screen = pygame.display.set_mode((full_w, full_h), self._flags)
+            self.screen = make_surface(full_w, full_h)
             self.width, self.height = full_w, full_h
-            # set_mode alone does NOT resize the physical window in SDL2 -
-            # force it, exactly like __init__ does (SWP_NOZORDER, with size),
-            # at the chosen monitor's origin.
-            hwnd = pygame.display.get_wm_info()['window']
-            x, y = getattr(self, "_origin", (0, 0))
-            user32.SetWindowPos(hwnd, 0, x, y, full_w, full_h, 0x0004)
-            self._set_topmost()
-            # The recreated window lost EVERYTHING: the layered attributes
-            # (colorkey + alpha), the capture affinity and the input styles.
-            self.set_hud_only(self._hud_only, force=True)
-            self.set_menu_opaque(self.menu.visible)
-            self.set_excluded_from_capture(self._excluded)
-            self.set_menu_input(self._menu_input)
+            self._overlay.resize(full_w, full_h)
+            self._overlay.set_fullscreen()
         except Exception as exc:
             print(f'Display: WARNING cannot expand the layer: {exc}')
 
@@ -767,15 +601,16 @@ class Display:
         if self._switch_active:
             return
         # It used to shrink the layer onto the window here, and the menu
-        # expanded it again on the way in. That dance cost a
-        # pygame.display.set_mode each way - the SDL window is recreated and
-        # every attribute re-applied - and once alerts started needing the
-        # full screen too it became several per second: "a lot of blinking
+        # expanded it again on the way in. That dance cost a set_mode each
+        # way - the SDL window was recreated and every attribute re-applied -
+        # and once alerts started needing the full screen too it became
+        # several per second: "a lot of blinking
         # of both the alert and the menu when picking windows" (user, 13.09).
         #
         # So the layer stays the size of the screen in one-window mode. It is
-        # click-through and colour-keyed, so a layer nobody has drawn on is
-        # not visible; what changes is that the HUD, the menu and the alerts
+        # click-through and transparent where nothing is drawn, so a layer
+        # nobody has drawn on is not visible; what changes is that the HUD,
+        # the menu and the alerts
         # are placed against the screen instead of against somebody's window,
         # which is where they were asked to be in the first place.
         try:
@@ -786,92 +621,55 @@ class Display:
             print(f'Display: WARNING cannot hold the layer on the screen: {exc}')
 
     def set_menu_opaque(self, opaque: bool) -> None:
-        """Drop the global window translucency while the menu is open.
+        """Drop the layer's global translucency while the menu is open.
 
-        The layer lives at BG_ALPHA so the HUD does not plaster over the
-        picture. But the menu panel is nearly black and a bright frame shows
-        through it - it reads as "too transparent". While the menu is up we set
-        255.
+        The layer lives at BG_ALPHA in HUD mode so the readings do not
+        plaster over the picture. The menu panel is nearly black, and a
+        bright frame showing through it reads as "too transparent"; while
+        the menu is up the layer goes fully opaque.
         """
         if not self._hud_only:
             return
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-        except Exception:
-            return
-        r, g, b = CHROMA_KEY
-        key = (b << 16) | (g << 8) | r
-        alpha = 255 if opaque else BG_ALPHA
-        user32.SetLayeredWindowAttributes(hwnd, key, alpha, LWA_COLORKEY | LWA_ALPHA)
+        self._layer_alpha = 255 if opaque else BG_ALPHA
 
     def set_hud_only(self, enabled: bool, force: bool = False) -> None:
-        """HUD mode: the worker draws the frame in its own window, only the HUD
-        stays here.
+        """HUD mode: the worker draws the frame, only the HUD stays here.
 
-        The background is filled with CHROMA_KEY and made transparent through
-        SetLayeredWindowAttributes(LWA_COLORKEY) - the worker's overlay shows
-        through it, while the HUD, alerts and watermark are drawn on top as
-        before. Turning it off restores the ordinary opaque mode (LWA_ALPHA).
-        force=True: reapply the attributes even when the mode did not change -
-        z-order operations (SetWindowPos/TopMost after the settings menu) can
-        drop LWA_COLORKEY, and an early return would leave the window opaque.
+        The background becomes transparent and the worker's own surface
+        shows through it, while the HUD, the alerts and the menu are drawn
+        on top as before.
+
+        On Windows this was a colour key, because a layered window has one
+        global alpha and no per-pixel one: the background was filled with a
+        magenta that could not occur in the palette and Windows punched
+        exactly that colour out. The comment explaining why the panel's
+        translucency had to come from the window's global alpha rather than
+        from the pixels - a blended magenta is not the key colour, and the
+        key does not cut out a blend, so it came out as a pink slab - is
+        the clearest statement of why that mechanism was a workaround.
+
+        A Wayland surface carries real per-pixel alpha, so the background is
+        simply transparent and the panel's own alpha does what it says.
+        `force` is kept for the callers, and now costs nothing: there is no
+        attribute that z-order operations can silently drop.
         """
         if enabled == self._hud_only and not force:
             return
         self._hud_only = enabled
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-        except Exception as exc:
-            print(f"Display: WARNING cannot get hwnd for HUD mode: {exc}")
-            return
-        if enabled:
-            # COLORREF is 0x00BBGGRR, not RGB
-            r, g, b = CHROMA_KEY
-            key = (b << 16) | (g << 8) | r
-            # The panel translucency comes from the window's GLOBAL alpha
-            # (LWA_ALPHA), NOT from the alpha of the panel pixels: a
-            # semi-transparent SRCALPHA blend with the magenta background would
-            # give a colour != key and a pink slab (the colour key does not cut
-            # out a blended colour). The colour key removes the background
-            # entirely, and the opaque panel (plus text) becomes slightly
-            # see-through through the global alpha.
-            ok = user32.SetLayeredWindowAttributes(hwnd, key, BG_ALPHA, LWA_COLORKEY | LWA_ALPHA)
-        else:
-            ok = user32.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
-        if not ok:
-            print(f"Display: WARNING SetLayeredWindowAttributes failed "
-                  f"(HUD mode {'on' if enabled else 'off'})")
+        self._layer_alpha = BG_ALPHA if enabled else 255
         self._last_overlay = 0.0  # the next draw_overlay redraws immediately
 
     def raise_topmost(self) -> None:
-        """Raise the worker picture first and the HUD last.
+        """Nothing to do, and nothing to race with.
 
-        Both windows are topmost, and inside that group the one raised last
-        ends up on top. The worker creates its window after ours, so after
-        every raise of its overlay the picture is raised first and the HUD is
-        brought back up last, otherwise it ends up under the frame and becomes
-        invisible.
+        On Windows both our overlay and the worker's picture window were
+        topmost, and inside that group whichever was raised last won - so
+        this had to raise the picture first and the HUD after it, on a
+        timer, forever. Wayland stacks by layer: the worker's picture is an
+        ordinary surface and ours is on the overlay layer, which is above
+        it by protocol. There is no order to re-assert and no window to
+        find by class name.
         """
-        # SWP_NOACTIVATE: the 30-frame re-assert must not steal the keyboard
-        # focus back from the user (audit 10.09 F2: with the menu open the
-        # overlay has WS_EX_NOACTIVATE removed, and a SetWindowPos that
-        # activates re-steals focus <=0.5 s after Alt+Tab / minimizing
-        # another window).
-        # Picture first, HUD last. Keep the two raises independent: a missing
-        # or not-yet-created present window must never hide the HUD raise.
-        try:
-            present = user32.FindWindowW("NeuralScreenPresent", "NeuralScreen")
-            if present:
-                user32.SetWindowPos(present, -1, 0, 0, 0, 0,
-                                    0x0001 | 0x0002 | 0x0010)
-        except Exception:
-            pass
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0,
-                                              0x0001 | 0x0002 | 0x0010)
-        except Exception:
-            pass
 
     def enter_switch_mode(self, last_frame: "np.ndarray | None" = None,
                           full_w: int = 0, full_h: int = 0) -> None:
@@ -930,24 +728,20 @@ class Display:
         # set directly - set_hud_only() would rewrite self._hud_only, which
         # must keep the pipeline's state for exit_switch_mode().
         try:
-            self.screen = pygame.display.set_mode((fw, fh), self._flags)
-            hwnd = pygame.display.get_wm_info()["window"]
-            x, y = getattr(self, "_origin", (0, 0))
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, fw, fh, 0x0004)
-            self._set_topmost()
-            # The colour key is dropped for the veil: it must not mix with
-            # the veiled pixels into a magenta wash. The global alpha is
-            # the veil's own; the out-fade moves it back to the value the
-            # pipeline expects before the teardown re-applies it.
+            self.screen = make_surface(fw, fh)
+            self._overlay.resize(fw, fh)
+            self._overlay.set_fullscreen()
+            self.width, self.height = fw, fh
+            # The veil owns the layer's translucency for the duration; the
+            # out-fade hands it back to the value the pipeline expects
+            # before the teardown re-applies it.
             self._apply_switch_window_alpha()
-            # set_mode re-created the window: every exstyle bit is gone
-            # (TOOLWINDOW/TRANSPARENT/NOACTIVATE/LAYERED). Re-assert them or
-            # the overlay gets a taskbar thumbnail again and eats clicks
-            # during the switch (audit 10.09: enter/exit_switch_mode was the
-            # only re-creation path that never restored the styles - a
-            # fullscreen->fullscreen Num5 with the menu closed lost them
-            # until the next menu open or pipeline resize).
-            self.set_menu_input(self._menu_input)
+            # Nothing else to restore. On Windows this was the one
+            # re-creation path that forgot to put the extended styles back,
+            # and a fullscreen-to-fullscreen Num5 with the menu closed lost
+            # click-through until the next menu open (audit 10.09). A layer
+            # surface cannot lose them: resizing it changes its buffers,
+            # not its role, its input region or its keyboard mode.
         except Exception as exc:
             print(f"Display: WARNING cannot set the switch overlay up: {exc}")
 
@@ -968,7 +762,7 @@ class Display:
             self._switch_alpha = float(SWITCH_ALPHA) * frac
             try:
                 self._draw_veil(frac, time.monotonic())
-                pygame.display.flip()
+                self._present()
             except Exception as exc:
                 print(f"Display: WARNING switch fade-in: {exc}")
                 break
@@ -1147,11 +941,7 @@ class Display:
             # desktop showing through (user: the veil must not go dark).
             # The entrance crossfade is pixel-side on both paths.
             a = float(SWITCH_ALPHA)
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            user32.SetLayeredWindowAttributes(hwnd, 0, int(round(a)), LWA_ALPHA)
-        except Exception as exc:
-            print(f"Display: WARNING cannot set the veil alpha: {exc}")
+        self._layer_alpha = max(0, min(255, int(round(a))))
 
     def _draw_switch(self) -> None:
         """The veil, as the loop draws it: advance the fade, then paint.
@@ -1253,30 +1043,22 @@ class Display:
 
 
     def refresh_colorkey(self) -> None:
-        """Reapply LWA_COLORKEY on the pygame window (the HUD layer).
+        """Nothing to refresh. Kept because the callers still call it.
 
-        Needed after operations that can drop the window's layered attributes
-        (z-order shuffling with the tkinter settings menu: the window stays
-        opaque and the HUD is not visible). Recreates nothing - only
-        SetLayeredWindowAttributes, unlike set_hud_only(force=True).
+        On Windows the layered attributes could be dropped behind the
+        program's back by z-order operations, leaving the window opaque and
+        the HUD invisible, so every such operation had to be followed by a
+        re-application. A Wayland surface's alpha is in its pixels; there is
+        nothing outside the buffer to lose.
         """
-        if not self._hud_only:
-            return
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-        except Exception:
-            return
-        r, g, b = CHROMA_KEY
-        key = (b << 16) | (g << 8) | r
-        user32.SetLayeredWindowAttributes(hwnd, key, BG_ALPHA, LWA_COLORKEY | LWA_ALPHA)
 
     def draw_capture_overlay(self, surface: pygame.Surface) -> None:
         """Bake the open menu into a recorded or screenshot frame.
 
-        The frame is grabbed WITHOUT our pygame layer: the window is marked
-        WDA_EXCLUDEFROMCAPTURE, otherwise DDA would capture our own output.
-        So everything that must end up in the file is drawn here, on top of the
-        pixels already received.
+        The frame is the worker's output, which never contains our overlay:
+        the recorder encodes what the pipeline produced, not what the
+        compositor shows. So everything that must end up in the file is
+        drawn here, on top of the pixels already received.
 
         We bake the menu only. The HUD and the watermark used to be baked too,
         but they are not on screen - in the file they looked like someone
@@ -1301,10 +1083,7 @@ class Display:
         Alerts appear and disappear out of band, so for them the redraw is
         immediate.
         """
-        try:
-            pygame.event.pump()
-        except Exception:
-            pass
+        SHELL.pump()
         now = time.monotonic()
         alerts = len(self._alerts)
         # With the menu open throttling is disabled: 10 Hz is enough for a
@@ -1326,7 +1105,7 @@ class Display:
             # regular layer in the same frame - nothing goes missing.
             self._draw_switch()
             if self._switch_active:
-                pygame.display.flip()
+                self._present()
                 return
         self.screen.fill(CHROMA_KEY)
         self._draw_alerts()
@@ -1335,7 +1114,7 @@ class Display:
         self.menu.draw(self.screen)
         self._draw_window_highlight()
         self._sync_cursor()
-        pygame.display.flip()
+        self._present()
 
     def _draw_window_highlight(self) -> None:
         """The amber outline around the window hovered in the windows page.
@@ -1346,15 +1125,21 @@ class Display:
         amber (#FFBF00, the brand accent), 3 px, with a 1 px dark inner
         line so it reads on both light and dark windows.
         """
-        hwnd = getattr(self.menu, "hover_window", None)
-        if not hwnd:
+        handle = getattr(self.menu, "hover_window", None)
+        if not handle:
             return
         try:
-            rect = wintypes.RECT()
-            if not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
+            # Where the window is, if this compositor says. sway and
+            # Hyprland do; the rest do not, and then there is no outline to
+            # draw - the row in the list still highlights, which is the part
+            # that tells the user which entry they are on.
+            bounds = toplevels.window_frame_rect(handle)
+            if bounds is None:
                 return
-            if rect.right <= rect.left or rect.bottom <= rect.top:
+            wx, wy, ww, wh = bounds
+            if ww <= 0 or wh <= 0:
                 return
+            rect = _Rect(wx, wy, wx + ww, wy + wh)
             # GetWindowRect answers in VIRTUAL-DESKTOP coordinates; this
             # surface is the chosen monitor, whose corner is self._origin.
             # Without the subtraction the outline drew at the window's
@@ -1412,10 +1197,7 @@ class Display:
         """
         if frame_rgba is None:
             return
-        try:
-            pygame.event.pump()
-        except Exception:
-            pass
+        SHELL.pump()
         try:
             surface = pygame.image.frombuffer(
                 frame_rgba, (frame_rgba.shape[1], frame_rgba.shape[0]), "RGBX")
@@ -1445,17 +1227,46 @@ class Display:
         # and the fade-out would never be seen on this path.
         if self._switch_active:
             self._draw_switch()
-        pygame.display.flip()
+        self._present()
+
+    def _present(self) -> None:
+        """Hand the drawn surface to the compositor.
+
+        The counterpart of pygame.display.flip(), and the one place the
+        overlay's pixels leave this module. `opaque` is the fast path: with
+        the worker not presenting, the frame fills the layer and there is
+        no alpha to premultiply.
+        """
+        try:
+            self._overlay.present(self.screen,
+                                  opaque=not self._hud_only
+                                  and self._layer_alpha >= 255,
+                                  global_alpha=self._layer_alpha)
+        except Exception as exc:
+            print(f"Display: WARNING could not present the frame: {exc}")
+
+    def pump(self) -> None:
+        """Read whatever the compositor has to say. Called once per loop.
+
+        SDL's event.pump() used to drain the Windows message queue here,
+        without which the window froze on click or focus. The Wayland
+        equivalent is dispatching the display's queue, and the reason is
+        the same: the connection has to be read or it backs up.
+        """
+        SHELL.pump()
 
     def poll_events(self) -> List[str]:
-        """Return event names: 'quit' (Esc / window close), 'toggle' (Num1/F10).
+        """Return event names: 'quit' (Esc / the compositor closing us),
+        'toggle' (Num1/F10).
 
-        This is the local path, for when our own window has the focus - the
-        global hotkeys are RegisterHotKey in hotkeys.py. Num1 matches the
-        default binding; F10 stays as a local-path compatibility key.
+        This is the local path, for when the menu holds the keyboard - the
+        global hotkeys are the GlobalShortcuts portal, in hotkeys.py. Num1
+        matches the default binding; F10 stays as a local-path
+        compatibility key.
         """
+        SHELL.pump()
         events = []
-        for event in pygame.event.get():
+        for event in self._overlay.poll():
             if event.type == pygame.QUIT:
                 events.append("quit")
             elif event.type == pygame.KEYDOWN:
@@ -1465,10 +1276,20 @@ class Display:
                     events.append("toggle")
         return events
 
-    def close(self) -> None:
-        pygame.quit()
+    def menu_events(self) -> list:
+        """The raw pygame-shaped events, for the menu to handle.
 
-    # -- HUD --------------------------------------------------------------
+        The menu was written against pygame's event objects and still is:
+        wayland_shell builds the same objects out of wl_pointer and
+        wl_keyboard, so overlay_ui.py did not have to change at all.
+        """
+        SHELL.pump()
+        return self._overlay.poll()
+
+    def close(self) -> None:
+        self._overlay.close()
+        SHELL.close()
+        pygame.quit()
 
     def _draw_rec_indicator(self) -> None:
         """The recording indicator outside the menu: a red dot + timer.
@@ -1518,32 +1339,26 @@ class Display:
                                 rect.y + pad_y))
 
     def _own_rect(self) -> tuple[int, int, int, int] | None:
-        """Where the overlay window itself sits on the desktop."""
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            rect = wintypes.RECT()
-            if not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect)):
-                return None
-            return (rect.left, rect.top,
-                    rect.right - rect.left, rect.bottom - rect.top)
-        except Exception:
-            return None
+        """Where the overlay itself sits, in the compositor's coordinates.
+
+        The overlay is anchored to one output and is that output's size, so
+        this is the output's own rectangle - which is also why it can never
+        disagree with the screen the way a positioned window could.
+        """
+        x, y = getattr(self, "_origin", (0, 0))
+        return (x, y, self.width, self.height)
 
     def _screen_rect(self) -> tuple[int, int, int, int] | None:
-        """The monitor the overlay is on, in desktop coordinates."""
-        try:
-            hwnd = pygame.display.get_wm_info()["window"]
-            monitor = user32.MonitorFromWindow(ctypes.c_void_p(hwnd), 2)  # NEAREST
-            if not monitor:
-                return None
-            info = ctypes.create_string_buffer(40 + 32 * 2)
-            ctypes.memmove(info, struct.pack("<I", len(info)), 4)
-            if not user32.GetMonitorInfoW(ctypes.c_void_p(monitor), info):
-                return None
-            left, top, right, bottom = struct.unpack_from("<4i", info, 4)
-            return (left, top, right - left, bottom - top)
-        except Exception:
-            return None
+        """The monitor the overlay is on, in compositor coordinates."""
+        output = getattr(self._overlay, "output", None)
+        if output is None:
+            return self._own_rect()
+        width, height = output.width, output.height
+        if output.rotated:
+            width, height = height, width
+        if not width or not height:
+            return self._own_rect()
+        return (output.x, output.y, int(width), int(height))
 
     def _alert_rect(self, w: int, h: int) -> "pygame.Rect":
         """Where an alert of this size goes, in overlay-local pixels.

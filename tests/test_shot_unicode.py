@@ -12,7 +12,7 @@ So the encoder writes to memory and Python writes the bytes. This test pins
 both halves: that the helper still produces a readable JPEG, and that it does
 so under a path OpenCV cannot open itself.
 
-Run:  runtime\\python.exe tests\\test_shot_unicode.py
+Run:  python3 tests\\test_shot_unicode.py
 """
 import sys
 import tempfile
@@ -36,11 +36,15 @@ NAMES = ["скриншоты", "スクリーンショット", "στιγμιότ�
 
 from dialogs import save_jpeg as write_jpeg  # noqa: E402
 
+from _needs import needs_wayland  # noqa: E402
+
 # The real writer, not a copy of it: a test that re-implements the code it
 # checks proves only that the copy works.
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     import cv2
 
     rgba = np.zeros((64, 96, 4), dtype=np.uint8)

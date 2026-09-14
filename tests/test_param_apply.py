@@ -22,7 +22,7 @@ not rebuild, and that the new parameters really reach the network - a
 change that arrived and did nothing would look exactly the same from
 the outside.
 
-Run:  runtime\\python.exe tests\\test_param_apply.py
+Run:  python3 tests\\test_param_apply.py
 """
 import struct
 import subprocess
@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+from _needs import needs_worker  # noqa: E402
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
@@ -102,6 +104,8 @@ def send_params(worker, params, w=W, h=H):
 
 
 def main() -> int:
+    if (skip := needs_worker()) is not None:
+        return skip
     failures = []
     faithful = dict(PROFILES["Faithful"])
     extreme = dict(PROFILES["Extreme / Overdrive"])

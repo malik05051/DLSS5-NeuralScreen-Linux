@@ -36,6 +36,64 @@ WORK_MAX_W = 2560
 WORK_MAX_H = 1440
 
 
+# ---------------------------------------------------------------------------
+# POSIX shared memory
+# ---------------------------------------------------------------------------
+#
+# Windows had named sections: CreateFileMapping(INVALID_HANDLE_VALUE, name)
+# here and OpenFileMappingA(name) in the worker, with the name carried in the
+# SHMI message. POSIX has the same shape under a different spelling -
+# shm_open(name) on both sides - so the protocol is unchanged and only the
+# two system calls differ.
+#
+# The name still travels as a string and still starts with a slash, which is
+# what shm_open wants and what the worker passes straight through. The
+# segment is unlinked as soon as both sides have it mapped: an unlinked
+# segment stays alive for its mappings and disappears when the last one
+# goes, so a crash cannot leave 33 MB of /dev/shm behind - which the
+# Windows sections could not do either, and is the one property worth
+# keeping.
+
+
+class _Shm:
+    """One POSIX shared-memory segment, mapped."""
+
+    def __init__(self, name: str, size: int):
+        self.name = name
+        self.size = size
+        path = f"/dev/shm{name}"
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            os.ftruncate(fd, size)
+            self.map = mmap.mmap(fd, size)
+        finally:
+            os.close(fd)
+        self._path = path
+        self._unlinked = False
+
+    def unlink(self) -> None:
+        """Drop the name; the mapping stays until every side closes it."""
+        if self._unlinked:
+            return
+        self._unlinked = True
+        try:
+            os.unlink(self._path)
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        self.unlink()
+        try:
+            self.map.close()
+        except (BufferError, ValueError):
+            pass
+
+
+def _shm_name(prefix: str) -> str:
+    """A name shm_open accepts: one leading slash, no others, short."""
+    return f"/{prefix}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+
+
 class SharedFrameBuffer:
     """Shared memory for the worker's input frame (the SHMI command).
 
@@ -58,8 +116,9 @@ class SharedFrameBuffer:
         self.size = self.color_capacity + self.motion_capacity
         # The section name: ASCII, unique per process - the worker opens it
         # through OpenFileMappingA in the same Windows session.
-        self.name = f"NeuralScreen_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-        self._mm = mmap.mmap(-1, self.size, tagname=self.name)
+        self._shm = _Shm(_shm_name("neuralscreen"), self.size)
+        self.name = self._shm.name
+        self._mm = self._shm.map
         self._buf = np.ndarray((self.size,), dtype=np.uint8, buffer=self._mm)
         self.negotiated = False  # set by start_worker after SACK
 
@@ -69,7 +128,8 @@ class SharedFrameBuffer:
         # DISOpticalFlow.
         self.gray_w, self.gray_h = 0, 0
         self.gray_bytes = 0
-        self.gray_name = f"NeuralScreenGray_{os.getpid()}_{uuid.uuid4().hex[:6]}"
+        self.gray_name = ""
+        self._gray_shm: "_Shm | None" = None
         self._gray_mm: mmap.mmap | None = None
         self._gray_buf: np.ndarray | None = None  # (gray_bytes,) uint8
 
@@ -77,6 +137,7 @@ class SharedFrameBuffer:
         self.out_w, self.out_h = 0, 0
         self.out_bytes = 0
         self.out_name = ""
+        self._out_shm: "_Shm | None" = None
         self._out_mm: mmap.mmap | None = None
         self._out_buf: np.ndarray | None = None  # (h, w, 4) uint8
 
@@ -94,8 +155,9 @@ class SharedFrameBuffer:
         self.close_gray()
         self.gray_w, self.gray_h = w, h
         self.gray_bytes = w * h
-        self.gray_name = f"NeuralScreenGray_{os.getpid()}_{uuid.uuid4().hex[:6]}"
-        self._gray_mm = mmap.mmap(-1, self.gray_bytes, tagname=self.gray_name)
+        self._gray_shm = _Shm(_shm_name("ns-gray"), self.gray_bytes)
+        self.gray_name = self._gray_shm.name
+        self._gray_mm = self._gray_shm.map
         self._gray_buf = np.ndarray((self.gray_bytes,), dtype=np.uint8, buffer=self._gray_mm)
 
     def open_out(self, w: int, h: int) -> None:
@@ -111,8 +173,9 @@ class SharedFrameBuffer:
         self.close_out()
         self.out_w, self.out_h = w, h
         self.out_bytes = w * h * 4 + 8  # + seqlock
-        self.out_name = f"NeuralScreenOut_{os.getpid()}_{uuid.uuid4().hex[:6]}"
-        self._out_mm = mmap.mmap(-1, self.out_bytes, tagname=self.out_name)
+        self._out_shm = _Shm(_shm_name("ns-out"), self.out_bytes)
+        self.out_name = self._out_shm.name
+        self._out_mm = self._out_shm.map
         self._out_buf = np.ndarray((h, w, 4), dtype=np.uint8, buffer=self._out_mm, offset=8)
 
     def read_out(self) -> np.ndarray | None:
@@ -140,12 +203,10 @@ class SharedFrameBuffer:
     def close_out(self) -> None:
         if self._out_buf is not None:
             self._out_buf = None
-        if self._out_mm is not None:
-            try:
-                self._out_mm.close()
-            except Exception:
-                pass
-            self._out_mm = None
+        if self._out_shm is not None:
+            self._out_shm.close()
+            self._out_shm = None
+        self._out_mm = None
         self.out_bytes = 0
         self.out_w = self.out_h = 0
 
@@ -165,12 +226,10 @@ class SharedFrameBuffer:
     def close_gray(self) -> None:
         if self._gray_buf is not None:
             self._gray_buf = None
-        if self._gray_mm is not None:
-            try:
-                self._gray_mm.close()
-            except Exception:
-                pass
-            self._gray_mm = None
+        if self._gray_shm is not None:
+            self._gray_shm.close()
+            self._gray_shm = None
+        self._gray_mm = None
 
     def put(self, rgba: np.ndarray, motion: np.ndarray) -> None:
         """Put the frame and motion into the mapping (one memcpy each)."""
@@ -190,8 +249,9 @@ class SharedFrameBuffer:
         self.negotiated = False
         self.close_gray()
         self._buf = None  # numpy holds the buffer: without the reset mmap.close() raises BufferError
+        self._mm = None
         try:
-            self._mm.close()
+            self._shm.close()
         except Exception as exc:
             print(f"[main] could not close the shared memory: {exc}", file=sys.stderr)
 
@@ -282,7 +342,7 @@ RACK_FMT = "<4Iq"         # magic, ok, ngx_result, reserved, pts (24 bytes)
 DDA_MAGIC = 0x31414444  # 'DDA1'
 WGC_MAGIC = 0x57434757      # 'WGCW' - capture ONE window instead of the desktop
 WGC_ACK_MAGIC = 0x4B414757  # 'WGAK' - its acknowledgement, with the real capture size
-WGC_FMT = "<4IqQ"           # magic, width, height, flags, pts, hwnd
+WGC_FMT = "<4IqQ"           # magic, width, height, flags, pts, pipewire node
 WGC_ACK_FMT = "<4Iq"        # magic, ok, width, height, pts
 DDA_ACK_MAGIC = 0x4B434144  # 'DACK'
 DDA_FMT = "<4Iq"        # magic, width, height, flags, pts (24 bytes)
@@ -422,7 +482,14 @@ def send_window(worker: subprocess.Popen, width: int, height: int,
 
 def send_dda(worker: subprocess.Popen, width: int, height: int,
              flags: int = 0, pts: int = 0) -> None:
-    """DDA1: ask the worker to capture the screen itself (Desktop Duplication).
+    """DDA1: ask the worker to capture the screen itself.
+
+    The name is the Windows one and the message is unchanged; what it means
+    has moved. There the worker opened Desktop Duplication on the monitor
+    index it had been given. Here the portal has already granted a capture
+    before the worker started, and the worker inherits the PipeWire remote
+    as file descriptor 3 and the node id in NS_PW_NODE - so this message
+    says "start reading it", not "go and find a screen".
 
     width=height=0 turns the capture off and goes back to sending the frame
     from Python. While it is active FRM1 frames carry FRAME_FLAG_NO_COLOR
@@ -433,17 +500,24 @@ def send_dda(worker: subprocess.Popen, width: int, height: int,
     worker.stdin.flush()
 
 
-def send_wgc(worker: subprocess.Popen, hwnd: int, width: int = 0,
+def send_wgc(worker: subprocess.Popen, node: int, width: int = 0,
              height: int = 0, pts: int = 0) -> None:
     """WGCW: ask the worker to capture ONE window instead of the desktop.
 
-    Windows Graphics Capture of a single window is unaffected by whatever is
-    drawn on top of it, so there is no self-capture loop - which is the whole
-    reason for this mode: the overlay no longer has to hide from screen
-    capture, and an outside recorder can see it. hwnd = 0 turns it off.
+    The 64-bit field carried an HWND and now carries a PipeWire node id -
+    the portal's answer when the user picks a window. The wire format is
+    unchanged because the field was always opaque to everything between
+    here and the worker.
+
+    A per-window capture is unaffected by whatever is drawn on top of the
+    window, so there is no self-capture loop. On Windows that was this
+    mode's whole reason for existing, because the overlay otherwise had to
+    hide itself from screen capture; here the overlay is a layer surface
+    and is never in the stream anyway, so window mode is what it says on
+    the tin and nothing else depends on it. node = 0 turns it off.
     """
     worker.stdin.write(struct.pack(WGC_FMT, WGC_MAGIC, int(width), int(height),
-                                   0, int(pts), int(hwnd)))
+                                   0, int(pts), int(node)))
     worker.stdin.flush()
 
 

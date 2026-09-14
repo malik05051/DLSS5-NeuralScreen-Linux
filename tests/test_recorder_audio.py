@@ -10,11 +10,11 @@ file back and checks that:
 
 A machine with no playback endpoint is not a failure - the test says SKIP.
 """
+import subprocess
 import sys
 import tempfile
 import time
 import wave
-import winsound
 from pathlib import Path
 
 import av
@@ -24,6 +24,8 @@ BASE = Path(__file__).resolve().parent.parent  # the project root
 sys.path.insert(0, str(BASE))  # the project modules (main.py, display.py, ...)
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ (autocheck)
 from recorder import VideoRecorder  # noqa: E402
+
+from _needs import needs_nvenc, needs_tool  # noqa: E402
 
 W, H = 1280, 720
 FPS = 30.0
@@ -52,6 +54,10 @@ def make_frame(i: int) -> np.ndarray:
 
 
 def main() -> int:
+    if (skip := needs_nvenc()) is not None:
+        return skip
+    if (skip := needs_tool("paplay")) is not None:
+        return skip
     failures = []
     out = Path(tempfile.gettempdir()) / "ns-test-audio.mp4"
     tone = Path(tempfile.gettempdir()) / "ns-test-tone.wav"
@@ -72,18 +78,23 @@ def main() -> int:
     # packets; once it stops, the idle endpoint delivers nothing at all, and
     # only the padding keeps the track growing. The second phase is what
     # actually exercises AUDIO_GAP_S/AUDIO_LAG_S.
-    winsound.PlaySound(str(tone), winsound.SND_FILENAME | winsound.SND_ASYNC)
+    # The Windows version used winsound to play a tone into the loopback.
+    # paplay is the PulseAudio/PipeWire equivalent and is part of the same
+    # package as pactl, which the capture already needs.
+    player = subprocess.Popen(["paplay", str(tone)],
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
     t0 = time.perf_counter()
     try:
         for i in range(FRAMES):
             if i == FRAMES // 2:
-                winsound.PlaySound(None, 0)     # silence from here on
+                player.terminate()              # silence from here on
             rec.write(make_frame(i))
             time.sleep(1.0 / FPS)
     finally:
         wall = time.perf_counter() - t0
         rec.close()
-        winsound.PlaySound(None, 0)
+        player.terminate()
         tone.unlink(missing_ok=True)
 
     print(f"recorded {wall:.2f} s of wall time, "

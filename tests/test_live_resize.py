@@ -25,7 +25,7 @@ What this pins, with no worker and no window:
   worker reads exactly work_w*work_h*4 bytes of motion, and the two
   drifting apart is what used to hang the program (see do_restart).
 
-Run:  runtime\\python.exe tests\\test_live_resize.py
+Run:  python3 tests\\test_live_resize.py
 """
 import sys
 import types

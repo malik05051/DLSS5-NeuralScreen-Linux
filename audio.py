@@ -1,17 +1,24 @@
-"""LoopbackCapture - system audio ("what you hear") through WASAPI loopback.
+"""LoopbackCapture - system audio ("what you hear") from the default sink's
+monitor.
 
-Records what the default playback device is playing, so a recording carries the
-game or video sound without a virtual cable and without a microphone.
+Records what the default playback device is playing, so a recording carries
+the game or video sound without a virtual cable and without a microphone.
 
-Written on raw ctypes/comtypes on purpose: comtypes is already in the runtime
-(dxcam pulls it), while sounddevice/PortAudio or pyaudiowpatch would add a
-dependency and megabytes to a runtime that was deliberately slimmed down.
+The Windows build did this with WASAPI loopback, which was the only way and
+came with a trap: while nothing plays at all, the endpoint hands back *no*
+data rather than silence, so a recorder that simply concatenates what it
+gets ends up with audio shorter than the video and drifting away from it.
+PipeWire and PulseAudio have no such trap - a monitor source produces
+silence when the sink is idle, at the rate it promised - but the padding in
+recorder.py is kept anyway: it costs nothing when there is nothing to pad,
+and the one thing worse than an audio track that drifts is an audio track
+that drifts only on some machines.
 
-WASAPI in loopback mode has one trap worth knowing: while nothing is playing at
-all, the endpoint hands back NO data - not silence, nothing. A recorder that
-just concatenates what it gets ends up with audio shorter than the video and
-drifting away from it. So read() reports how many frames it actually got and
-the caller pads the gaps from the clock (see recorder.VideoRecorder).
+Every Linux desktop that plays sound at all has a monitor source. On
+PipeWire the PulseAudio API is served by pipewire-pulse and the monitor is
+the same object; on a PulseAudio system it is native. So this talks
+libpulse's synchronous API - twenty lines of ctypes, no dependency, and
+correct on both - rather than choosing between two client libraries.
 
 Usage:
     cap = LoopbackCapture()
@@ -24,177 +31,116 @@ Usage:
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
+import os
+import shutil
+import subprocess
 import sys
 import threading
 import time
-from ctypes import POINTER, byref, c_void_p
-from ctypes.wintypes import DWORD, WORD
 
 import numpy as np
-from comtypes import COMMETHOD, GUID, CoCreateInstance, CoInitialize, CoUninitialize, IUnknown
-
-# --- WASAPI constants ------------------------------------------------------
-CLSID_MMDeviceEnumerator = GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}")
-
-AUDCLNT_SHAREMODE_SHARED = 0
-AUDCLNT_STREAMFLAGS_LOOPBACK = 0x00020000
-AUDCLNT_BUFFERFLAGS_SILENT = 0x2
-
-EDATAFLOW_RENDER = 0
-EROLE_CONSOLE = 0
-CLSCTX_ALL = 23
-
-WAVE_FORMAT_PCM = 0x0001
-WAVE_FORMAT_IEEE_FLOAT = 0x0003
-WAVE_FORMAT_EXTENSIBLE = 0xFFFE
-KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = GUID("{00000003-0000-0010-8000-00AA00389B71}")
-
-#: Buffer the endpoint keeps for us, in 100 ns units. 400 ms is generous: the
-#: reader polls far more often, and the slack only matters when the machine
-#: stalls (a fullscreen game starting, say). Losing audio there is worse than
-#: holding a bigger buffer.
-BUFFER_DURATION_100NS = 4_000_000
 
 
-class WAVEFORMATEX(ctypes.Structure):
-    # pshpack1.h in mmreg.h: the structs are byte-packed, no alignment
-    # padding. Without _pack_ ctypes aligns nAvgBytesPerSec/SubFormat and
-    # the structs come out larger than the real ABI - the layout read from
-    # the audio endpoint would be wrong (code review finding).
-    _pack_ = 1
-    _fields_ = [
-        ("wFormatTag", WORD),
-        ("nChannels", WORD),
-        ("nSamplesPerSec", DWORD),
-        ("nAvgBytesPerSec", DWORD),
-        ("nBlockAlign", WORD),
-        ("wBitsPerSample", WORD),
-        ("cbSize", WORD),
-    ]
+# pa_sample_format: 3 is PA_SAMPLE_FLOAT32LE, which is what the server mixes
+# in anyway, so asking for it costs no conversion in the daemon and saves
+# one here.
+PA_SAMPLE_FLOAT32LE = 3
+PA_STREAM_RECORD = 2
+
+#: The special source name PulseAudio resolves to "the monitor of whatever
+#: the default sink currently is". Following the default is the whole point:
+#: a user plugging in headphones mid-recording should keep being recorded.
+DEFAULT_MONITOR = "@DEFAULT_MONITOR@"
 
 
-class WAVEFORMATEXTENSIBLE(ctypes.Structure):
-    _pack_ = 1
-    _fields_ = [
-        ("Format", WAVEFORMATEX),
-        ("wValidBitsPerSample", WORD),
-        ("dwChannelMask", DWORD),
-        ("SubFormat", GUID),
-    ]
+class pa_sample_spec(ctypes.Structure):
+    _fields_ = [("format", ctypes.c_int),
+                ("rate", ctypes.c_uint32),
+                ("channels", ctypes.c_uint8)]
 
 
-class IAudioCaptureClient(IUnknown):
-    _iid_ = GUID("{C8ADBD64-E71E-48A0-A4DE-185C395CD317}")
-    _methods_ = [
-        COMMETHOD([], ctypes.HRESULT, "GetBuffer",
-                  (["out"], POINTER(POINTER(ctypes.c_byte)), "ppData"),
-                  (["out"], POINTER(ctypes.c_uint32), "pNumFramesToRead"),
-                  (["out"], POINTER(DWORD), "pdwFlags"),
-                  (["out"], POINTER(ctypes.c_uint64), "pu64DevicePosition"),
-                  (["out"], POINTER(ctypes.c_uint64), "pu64QPCPosition")),
-        COMMETHOD([], ctypes.HRESULT, "ReleaseBuffer",
-                  (["in"], ctypes.c_uint32, "NumFramesRead")),
-        COMMETHOD([], ctypes.HRESULT, "GetNextPacketSize",
-                  (["out"], POINTER(ctypes.c_uint32), "pNumFramesInNextPacket")),
-    ]
+class pa_buffer_attr(ctypes.Structure):
+    _fields_ = [("maxlength", ctypes.c_uint32), ("tlength", ctypes.c_uint32),
+                ("prebuf", ctypes.c_uint32), ("minreq", ctypes.c_uint32),
+                ("fragsize", ctypes.c_uint32)]
 
 
-class IAudioClient(IUnknown):
-    _iid_ = GUID("{1CB9AD4C-DBFA-4C32-B178-C2F568A703B2}")
-    _methods_ = [
-        COMMETHOD([], ctypes.HRESULT, "Initialize",
-                  (["in"], ctypes.c_uint32, "ShareMode"),
-                  (["in"], DWORD, "StreamFlags"),
-                  (["in"], ctypes.c_int64, "hnsBufferDuration"),
-                  (["in"], ctypes.c_int64, "hnsPeriodicity"),
-                  (["in"], POINTER(WAVEFORMATEX), "pFormat"),
-                  (["in"], POINTER(GUID), "AudioSessionGuid")),
-        COMMETHOD([], ctypes.HRESULT, "GetBufferSize",
-                  (["out"], POINTER(ctypes.c_uint32), "pNumBufferFrames")),
-        COMMETHOD([], ctypes.HRESULT, "GetStreamLatency",
-                  (["out"], POINTER(ctypes.c_int64), "phnsLatency")),
-        COMMETHOD([], ctypes.HRESULT, "GetCurrentPadding",
-                  (["out"], POINTER(ctypes.c_uint32), "pNumPaddingFrames")),
-        COMMETHOD([], ctypes.HRESULT, "IsFormatSupported",
-                  (["in"], ctypes.c_uint32, "ShareMode"),
-                  (["in"], POINTER(WAVEFORMATEX), "pFormat"),
-                  (["out"], POINTER(POINTER(WAVEFORMATEX)), "ppClosestMatch")),
-        COMMETHOD([], ctypes.HRESULT, "GetMixFormat",
-                  (["out"], POINTER(POINTER(WAVEFORMATEX)), "ppDeviceFormat")),
-        COMMETHOD([], ctypes.HRESULT, "GetDevicePeriod",
-                  (["out"], POINTER(ctypes.c_int64), "phnsDefaultDevicePeriod"),
-                  (["out"], POINTER(ctypes.c_int64), "phnsMinimumDevicePeriod")),
-        COMMETHOD([], ctypes.HRESULT, "Start"),
-        COMMETHOD([], ctypes.HRESULT, "Stop"),
-        COMMETHOD([], ctypes.HRESULT, "Reset"),
-        COMMETHOD([], ctypes.HRESULT, "SetEventHandle",
-                  (["in"], c_void_p, "eventHandle")),
-        COMMETHOD([], ctypes.HRESULT, "GetService",
-                  (["in"], POINTER(GUID), "riid"),
-                  (["out"], POINTER(c_void_p), "ppv")),
-    ]
+def _load_pulse():
+    """libpulse-simple, or None. Never raises."""
+    for name in ("libpulse-simple.so.0", "libpulse-simple.so",
+                 ctypes.util.find_library("pulse-simple")):
+        if not name:
+            continue
+        try:
+            lib = ctypes.CDLL(name)
+        except OSError:
+            continue
+        lib.pa_simple_new.restype = ctypes.c_void_p
+        lib.pa_simple_new.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p,
+            ctypes.c_char_p, ctypes.POINTER(pa_sample_spec), ctypes.c_void_p,
+            ctypes.POINTER(pa_buffer_attr), ctypes.POINTER(ctypes.c_int)]
+        lib.pa_simple_read.restype = ctypes.c_int
+        lib.pa_simple_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_size_t,
+                                       ctypes.POINTER(ctypes.c_int)]
+        lib.pa_simple_free.argtypes = [ctypes.c_void_p]
+        lib.pa_strerror.restype = ctypes.c_char_p
+        lib.pa_strerror.argtypes = [ctypes.c_int]
+        return lib
+    return None
 
 
-class IMMDevice(IUnknown):
-    _iid_ = GUID("{D666063F-1587-4E43-81F1-B948E807363F}")
-    _methods_ = [
-        COMMETHOD([], ctypes.HRESULT, "Activate",
-                  (["in"], POINTER(GUID), "iid"),
-                  (["in"], DWORD, "dwClsCtx"),
-                  (["in"], c_void_p, "pActivationParams"),
-                  (["out"], POINTER(c_void_p), "ppInterface")),
-        COMMETHOD([], ctypes.HRESULT, "OpenPropertyStore",
-                  (["in"], DWORD, "stgmAccess"),
-                  (["out"], POINTER(c_void_p), "ppProperties")),
-        COMMETHOD([], ctypes.HRESULT, "GetId",
-                  (["out"], POINTER(ctypes.c_wchar_p), "ppstrId")),
-        COMMETHOD([], ctypes.HRESULT, "GetState",
-                  (["out"], POINTER(DWORD), "pdwState")),
-    ]
+def default_monitor() -> str:
+    """The monitor source to record, resolved as concretely as possible.
 
-
-class IMMDeviceEnumerator(IUnknown):
-    _iid_ = GUID("{A95664D2-9614-4F35-A746-DE8DB63617E6}")
-    _methods_ = [
-        COMMETHOD([], ctypes.HRESULT, "EnumAudioEndpoints",
-                  (["in"], DWORD, "dataFlow"),
-                  (["in"], DWORD, "dwStateMask"),
-                  (["out"], POINTER(c_void_p), "ppDevices")),
-        COMMETHOD([], ctypes.HRESULT, "GetDefaultAudioEndpoint",
-                  (["in"], DWORD, "dataFlow"),
-                  (["in"], DWORD, "role"),
-                  (["out"], POINTER(POINTER(IMMDevice)), "ppEndpoint")),
-        COMMETHOD([], ctypes.HRESULT, "GetDevice",
-                  (["in"], ctypes.c_wchar_p, "pwstrId"),
-                  (["out"], POINTER(POINTER(IMMDevice)), "ppDevice")),
-        COMMETHOD([], ctypes.HRESULT, "RegisterEndpointNotificationCallback",
-                  (["in"], c_void_p, "pClient")),
-        COMMETHOD([], ctypes.HRESULT, "UnregisterEndpointNotificationCallback",
-                  (["in"], c_void_p, "pClient")),
-    ]
+    `@DEFAULT_MONITOR@` is the right answer and the server usually honours
+    it. When it does not - an old PulseAudio, a pipewire-pulse built
+    without the alias - the name is looked up with pactl, which every
+    desktop that has sound has. Falling back to the literal alias is
+    harmless: pa_simple_new simply fails and start() reports why.
+    """
+    pactl = shutil.which("pactl")
+    if pactl:
+        try:
+            sink = subprocess.run([pactl, "get-default-sink"],
+                                  capture_output=True, text=True, timeout=3)
+            name = sink.stdout.strip()
+            if name and not name.startswith("Failure"):
+                return f"{name}.monitor"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return DEFAULT_MONITOR
 
 
 class LoopbackCapture:
-    """WASAPI loopback on the default playback device.
+    """The default sink's monitor, read on its own thread.
 
-    All the COM work lives in one thread: MMDevice objects are apartment-bound,
-    and passing them between threads is exactly the kind of thing that fails
-    once in a while rather than every time. The thread pushes numpy chunks into
-    a list under a lock; read() takes everything accumulated so far.
+    All the library work lives in one thread, as it did for COM on Windows -
+    not because libpulse needs it, but because the reader blocks and the
+    caller is a 60 fps loop that must not.
 
     Output is always float32 (n, 2): the encoder wants one shape and does not
-    care what the endpoint happens to run at. The sample rate is whatever the
-    device mixes at (sample_rate) - resampling here would be pointless work,
+    care what the device happens to run at. The sample rate is whatever the
+    monitor reports (sample_rate) - resampling here would be pointless work,
     the AAC encoder takes 48 kHz just as happily as 44.1.
     """
 
-    #: How long the reader thread sleeps between polls. The endpoint hands out
-    #: packets at the device period (~10 ms), so polling faster only burns CPU.
-    POLL_S = 0.005
+    #: How much audio to ask for per read. 20 ms: long enough that the
+    #: syscall rate is irrelevant, short enough that stopping a recording
+    #: does not wait a visible time for the last block.
+    CHUNK_MS = 20
 
-    def __init__(self):
+    #: Above this the soft limiter starts folding. The system mix can hand
+    #: back peaks above 0 dBFS (measured up to +7.9 dB on the bench) and AAC
+    #: turns those into distortion.
+    LIMIT_THRESHOLD = 0.85
+
+    def __init__(self, device: str = ""):
         self.sample_rate = 0
         self.channels = 0
+        self.device = device
         self.error: str | None = None
         self._chunks: list[np.ndarray] = []
         self._lock = threading.Lock()
@@ -207,8 +153,8 @@ class LoopbackCapture:
     def start(self, timeout: float = 5.0) -> bool:
         """Start capturing. Returns False when audio is unavailable.
 
-        Never raises: a machine with no playback device, or with WASAPI
-        refusing the loopback, must still record video.
+        Never raises: a machine with no sound server, or a container with no
+        access to one, must still record video.
         """
         self._thread = threading.Thread(target=self._run, name="ns-audio",
                                         daemon=True)
@@ -219,8 +165,7 @@ class LoopbackCapture:
     def read(self) -> np.ndarray | None:
         """Everything captured since the previous call, or None if nothing.
 
-        Returns float32 (n, 2). A None means the endpoint had nothing - which
-        in loopback mode means silence, not a failure.
+        Returns float32 (n, 2).
         """
         with self._lock:
             if not self._chunks:
@@ -229,11 +174,11 @@ class LoopbackCapture:
         return chunks[0] if len(chunks) == 1 else np.concatenate(chunks, axis=0)
 
     def discard(self) -> None:
-        """Drop everything captured so far (the endpoint spin-up).
+        """Drop everything captured so far (the stream spin-up).
 
-        The samples that arrive between client.Start() and the recorder's
-        clock are earlier than the video PTS=0; keeping them would make the
-        audio track lead the picture (audit #3, D2).
+        The samples that arrive between the stream opening and the
+        recorder's clock are earlier than the video PTS=0; keeping them
+        would make the audio track lead the picture (audit #3, D2).
         """
         with self._lock:
             self._chunks.clear()
@@ -247,157 +192,114 @@ class LoopbackCapture:
     # -- capture thread ----------------------------------------------------
 
     def _run(self) -> None:
-        client = None
-        try:
-            CoInitialize()
-        except Exception:
-            pass
-        try:
-            client, capture, fmt = self._open()
-            self.sample_rate = fmt["rate"]
-            self.channels = 2
+        stream = None
+        lib = _load_pulse()
+        if lib is None:
+            self.error = ("libpulse-simple is not installed - no sound server "
+                          "client library to record the system mix with")
             self._started.set()
-            client.Start()
-            self._pump(capture, fmt)
-        except Exception as exc:                      # noqa: BLE001
+            return
+        try:
+            device = self.device or default_monitor()
+            # 48 kHz stereo: the rate every desktop mixes at, and the one the
+            # AAC encoder wants. Asking for the device's own rate would mean
+            # the async API; asking for this one lets the server resample,
+            # which it does better than we would.
+            spec = pa_sample_spec(PA_SAMPLE_FLOAT32LE, 48000, 2)
+            frame_bytes = 4 * spec.channels
+            fragment = int(spec.rate * self.CHUNK_MS / 1000) * frame_bytes
+            attr = pa_buffer_attr(maxlength=0xFFFFFFFF, tlength=0xFFFFFFFF,
+                                  prebuf=0xFFFFFFFF, minreq=0xFFFFFFFF,
+                                  fragsize=fragment)
+            err = ctypes.c_int(0)
+            stream = lib.pa_simple_new(
+                None, b"NeuralScreen", PA_STREAM_RECORD,
+                device.encode("utf-8"), b"screen recording",
+                ctypes.byref(spec), None, ctypes.byref(attr),
+                ctypes.byref(err))
+            if not stream:
+                detail = lib.pa_strerror(err).decode("utf-8", "replace")
+                self.error = f"could not open {device}: {detail}"
+                self._started.set()
+                return
+            self.sample_rate = spec.rate
+            self.channels = spec.channels
+            self._started.set()
+            self._pump(lib, stream, fragment, frame_bytes)
+        except Exception as exc:
             self.error = str(exc)
-            print(f"[audio] loopback unavailable: {exc}", file=sys.stderr)
             self._started.set()
         finally:
-            try:
-                if client is not None:
-                    client.Stop()
-            except Exception:
-                pass
-            try:
-                CoUninitialize()
-            except Exception:
-                pass
+            if stream:
+                try:
+                    lib.pa_simple_free(ctypes.c_void_p(stream))
+                except Exception:
+                    pass
 
-    def _open(self):
-        enumerator = CoCreateInstance(CLSID_MMDeviceEnumerator,
-                                      IMMDeviceEnumerator, CLSCTX_ALL)
-        device = enumerator.GetDefaultAudioEndpoint(EDATAFLOW_RENDER,
-                                                    EROLE_CONSOLE)
-        ptr = device.Activate(byref(IAudioClient._iid_), CLSCTX_ALL, None)
-        client = ctypes.cast(ptr, POINTER(IAudioClient))
-
-        mix = client.GetMixFormat()
-        fmt = self._describe(mix)
-        # Shared mode accepts only the endpoint's own mix format, so we hand
-        # back exactly what GetMixFormat gave us. hnsPeriodicity must be 0 in
-        # shared mode - the engine picks the period itself.
-        client.Initialize(AUDCLNT_SHAREMODE_SHARED,
-                          AUDCLNT_STREAMFLAGS_LOOPBACK,
-                          BUFFER_DURATION_100NS, 0, mix, None)
-        ptr = client.GetService(byref(IAudioCaptureClient._iid_))
-        capture = ctypes.cast(ptr, POINTER(IAudioCaptureClient))
-        return client, capture, fmt
-
-    @staticmethod
-    def _describe(mix) -> dict:
-        """Read the mix format: rate, channels, and how to read the samples."""
-        wfx = mix.contents
-        tag = wfx.wFormatTag
-        bits = wfx.wBitsPerSample
-        is_float = tag == WAVE_FORMAT_IEEE_FLOAT
-        if tag == WAVE_FORMAT_EXTENSIBLE:
-            # WAVEFORMATEXTENSIBLE carries 22 bytes of extension after the
-            # base WAVEFORMATEX. A smaller cbSize means the endpoint handed
-            # us a truncated format - casting past it would read garbage
-            # (code review finding).
-            if wfx.cbSize < 22:
-                raise RuntimeError(
-                    f"truncated extensible format: cbSize={wfx.cbSize} < 22")
-            ext = ctypes.cast(mix, POINTER(WAVEFORMATEXTENSIBLE)).contents
-            is_float = ext.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
-        if is_float and bits == 32:
-            dtype, scale = np.float32, 1.0
-        elif not is_float and bits == 16:
-            dtype, scale = np.int16, 1.0 / 32768.0
-        elif not is_float and bits == 32:
-            dtype, scale = np.int32, 1.0 / 2147483648.0
-        else:
-            raise RuntimeError(
-                f"unsupported mix format: tag={tag} bits={bits} float={is_float}")
-        return {"rate": int(wfx.nSamplesPerSec), "src_channels": int(wfx.nChannels),
-                "dtype": dtype, "scale": scale, "block": int(wfx.nBlockAlign)}
-
-    def _pump(self, capture, fmt: dict) -> None:
-        dtype = fmt["dtype"]
-        scale = fmt["scale"]
-        src_ch = fmt["src_channels"]
-        item = np.dtype(dtype).itemsize
+    def _pump(self, lib, stream, fragment: int, frame_bytes: int) -> None:
+        buf = ctypes.create_string_buffer(fragment)
+        err = ctypes.c_int(0)
         while not self._stop.is_set():
-            got_any = False
-            while True:
-                try:
-                    if capture.GetNextPacketSize() == 0:
-                        break
-                    data, frames, flags, _pos, _qpc = capture.GetBuffer()
-                except Exception as exc:              # noqa: BLE001
-                    self.error = str(exc)
-                    print(f"[audio] capture stopped: {exc}", file=sys.stderr)
-                    return
-                try:
-                    if frames:
-                        if flags & AUDCLNT_BUFFERFLAGS_SILENT:
-                            # The endpoint says "this packet is silence" and the
-                            # buffer contents are undefined - it must not be read.
-                            block = np.zeros((frames, 2), dtype=np.float32)
-                        else:
-                            raw = ctypes.string_at(data, frames * src_ch * item)
-                            arr = np.frombuffer(raw, dtype=dtype)
-                            arr = arr.reshape(frames, src_ch)
-                            block = self._to_stereo(arr, scale)
-                        with self._lock:
-                            self._chunks.append(block)
-                        got_any = True
-                finally:
-                    capture.ReleaseBuffer(frames)
-            if not got_any:
-                time.sleep(self.POLL_S)
+            if lib.pa_simple_read(ctypes.c_void_p(stream), buf, fragment,
+                                  ctypes.byref(err)) < 0:
+                detail = lib.pa_strerror(err).decode("utf-8", "replace")
+                # A monitor that goes away (the sink was removed) is not a
+                # reason to stop the recording - the video keeps going and
+                # the audio track simply ends where the device did.
+                self.error = f"the monitor source stopped: {detail}"
+                return
+            samples = np.frombuffer(buf.raw, dtype=np.float32).reshape(
+                -1, self.channels).copy()
+            with self._lock:
+                self._chunks.append(self._to_stereo(samples))
+
+    # -- shaping -----------------------------------------------------------
 
     @staticmethod
-    def _to_stereo(arr: np.ndarray, scale: float) -> np.ndarray:
-        """Endpoint frames -> float32 (n, 2).
+    def _to_stereo(arr: np.ndarray, scale: float = 1.0) -> np.ndarray:
+        """Fold any channel count down to stereo, scaled.
 
-        Multichannel endpoints (5.1, 7.1) are cut down to the front pair rather
-        than downmixed: a proper downmix needs the channel mask and per-channel
-        gains, and a screen recorder that gets the front channels right is
-        already the honest answer.
+        A 5.1 monitor is a real thing on a desktop with a receiver. Front
+        left/right carry the mix; the centre is folded in at -3 dB, which is
+        the downmix every player uses, and the rest are dropped rather than
+        guessed at.
         """
-        if arr.shape[1] >= 2:
-            out = arr[:, :2]
+        arr = np.asarray(arr, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        channels = arr.shape[1]
+        if channels == 1:
+            out = np.repeat(arr, 2, axis=1)
+        elif channels == 2:
+            out = arr
         else:
-            out = np.repeat(arr[:, :1], 2, axis=1)
-        out = out.astype(np.float32, copy=True)
+            out = arr[:, :2].copy()
+            if channels >= 3:
+                out += arr[:, 2:3] * 0.7071
         if scale != 1.0:
-            out *= scale
+            out = out * scale
+        # The limiter belongs here, not only in the caller: a downmix adds
+        # channels together and can push a mix that was inside [-1, 1] over
+        # the top, and this is the one funnel every chunk goes through.
         return LoopbackCapture._limit(out)
-
-    #: Soft limiter threshold. The system mix can hand back peaks above
-    #: 0 dBFS (measured up to +7.9 dB on the bench), and AAC clips those
-    #: peaks into distortion. Below the threshold the signal passes
-    #: untouched; above it a tanh tail folds the peak toward 1.0. A hard
-    #: clip would square off the waveform, a plain gain would duck the
-    #: whole recording.
-    LIMIT_THRESHOLD = 0.9
 
     @staticmethod
     def _limit(x: np.ndarray) -> np.ndarray:
-        """Soft-clip peaks above LIMIT_THRESHOLD toward 1.0.
+        """Fold peaks above the threshold toward 1.0 with a tanh tail.
 
-        Monotonic (louder in, louder out), sign-preserving, and a no-op
-        below the threshold - the same array comes back, so quiet passages
-        are bit-for-bit untouched.
+        Below the threshold nothing is touched - bit for bit, which is what
+        the regression test checks, and what makes this safe to run on every
+        chunk instead of only on loud ones. Above it the excess is folded
+        so the result never leaves [-1, 1] and never changes sign.
         """
-        if x.size == 0:
+        threshold = LoopbackCapture.LIMIT_THRESHOLD
+        peak = np.max(np.abs(x)) if x.size else 0.0
+        if peak <= threshold:
             return x
-        if float(np.abs(x).max()) <= LoopbackCapture.LIMIT_THRESHOLD:
-            return x
-        sign = np.sign(x)
-        a = (np.abs(x) - LoopbackCapture.LIMIT_THRESHOLD) / (
-            1.0 - LoopbackCapture.LIMIT_THRESHOLD)
-        return sign * (LoopbackCapture.LIMIT_THRESHOLD
-                       + (1.0 - LoopbackCapture.LIMIT_THRESHOLD) * np.tanh(a))
+        out = x.copy()
+        over = np.abs(out) > threshold
+        excess = np.abs(out[over]) - threshold
+        folded = threshold + (1.0 - threshold) * np.tanh(
+            excess / (1.0 - threshold))
+        out[over] = np.sign(out[over]) * folded
+        return out

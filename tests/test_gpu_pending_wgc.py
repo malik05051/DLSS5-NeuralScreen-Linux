@@ -12,7 +12,7 @@ Expected: the pending flag is consumed exactly once, by the first
 capture-channel negotiation after the switch, whatever its outcome.
 [audit python-core F5]
 
-Run:  runtime\\python.exe tests\\test_gpu_pending_wgc.py
+Run:  python3 tests\\test_gpu_pending_wgc.py
 """
 import sys
 import types
@@ -48,21 +48,20 @@ def main() -> int:
         lang="en", worker=None,
     )
 
-    import ctypes
     real_send = channels.send_wgc
     real_gray = channels.sync_gray
-    real_iswindow = ctypes.windll.user32.IsWindow
     channels.send_wgc = lambda *a, **k: None
     channels.sync_gray = lambda s: None
-    # The probe window is a fake handle: IsWindow would refuse it before the
-    # channel logic under test is reached.
-    ctypes.windll.user32.IsWindow = lambda hwnd: True
+    # The Windows version had to fake IsWindow here, because enable_wgc
+    # checked the handle before doing anything. There is no such call to
+    # fake: a client cannot ask whether another client's window is still
+    # alive, so the compositor ending the stream is the only signal and it
+    # arrives as the error path, which the next case exercises.
     try:
         ok = channels.enable_wgc(st)
     finally:
         channels.send_wgc = real_send
         channels.sync_gray = real_gray
-        ctypes.windll.user32.IsWindow = real_iswindow
 
     if not ok:
         failures.append("enable_wgc reported failure on a successful WGAK")

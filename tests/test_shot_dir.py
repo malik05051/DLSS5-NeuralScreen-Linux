@@ -14,6 +14,8 @@ import os
 import sys
 from pathlib import Path
 
+from _needs import needs_wayland  # noqa: E402
+
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
@@ -23,6 +25,8 @@ spec.loader.exec_module(ns_main)
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     failures = []
 
     # 1. The payload carries the configured folder.

@@ -11,7 +11,7 @@ by bring_up. This test builds the state the way bring_up does - by
 reading bring_up's source for st.X = assignments - and asserts the
 critical ones exist. [audit F2]
 
-Run:  runtime\\python.exe tests\\test_state_contract.py
+Run:  python3 tests\\test_state_contract.py
 """
 import re
 import sys

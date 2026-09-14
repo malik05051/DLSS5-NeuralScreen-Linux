@@ -18,7 +18,7 @@ Two hand-offs are checked here, both driven without launching the worker:
 * Display.set_origin() moves the real window, and _move_to_origin() with
   (0,0) does not move it (the pre-multi-monitor behaviour stays).
 
-Run:  runtime\\python.exe tests\\test_monitor_origin.py
+Run:  python3 tests\\test_monitor_origin.py
 """
 import ctypes
 import os
@@ -43,6 +43,8 @@ except Exception:
 
 import capture  # noqa: E402
 import startup  # noqa: E402
+
+from _needs import needs_wayland  # noqa: E402
 
 
 @contextmanager
@@ -86,6 +88,8 @@ class _Capture:
 
 
 def main() -> int:
+    if (skip := needs_wayland()) is not None:
+        return skip
     failures = []
     before = {k: os.environ.get(k) for k in ("NS_OUTPUT", "NS_WINDOW_POS")}
 

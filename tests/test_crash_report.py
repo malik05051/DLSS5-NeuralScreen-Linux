@@ -15,7 +15,7 @@ So: the loop's handler prints the traceback, and this pins it. Checked by
 importing main and driving the handler's shape rather than by crashing the
 real program - the point is the report, not the crash.
 
-Run:  runtime\\python.exe tests\\test_crash_report.py
+Run:  python3 tests\\test_crash_report.py
 """
 import re
 import sys

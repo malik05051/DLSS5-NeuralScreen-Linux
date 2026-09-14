@@ -1,112 +1,153 @@
-"""Re-registering hotkeys on the fly: suspend/resume/rebind.
+"""suspend / resume / rebind on the hotkey controller.
 
-RegisterHotKey with hWnd=None is bound to the calling thread, so assignments
-can only be removed and installed from inside the hotkey thread - through our
-own messages. This test checks that it actually happens rather than merely
-compiling.
+The Windows version of this test probed the system: it asked whether
+Ctrl+Alt+F6 could be registered from another thread, because RegisterHotKey
+with hWnd=None is bound to the calling thread and the whole point was that
+assignments were being installed and removed from inside the hotkey thread.
 
-It is checked by fact: after a rebind the new combination is in registered and
-the old one is not; after suspend, registering the same combination FROM THE
-OUTSIDE succeeds (so the hotkey really was released) and after resume it fails.
+None of that exists here and the probe has no counterpart - a client cannot
+ask the compositor whether a key is free, and it should not be able to. So
+the test moved to the layer that is actually ours: the controller's own
+behaviour between the backend and the command queue.
+
+  * suspend stops delivery and resume restores it - which is what the menu
+    needs while it is capturing a key, so that pressing Num1 to assign it
+    does not also toggle NR;
+  * a rebind replaces the bindings the backend is working from, so the key
+    the user just reassigned fires the new command and not the old one;
+  * `effective()` reports what the desktop bound rather than what we asked
+    for, because the compositor and the user have the final say and a menu
+    showing our wish would be lying.
+
+A fake portal session stands in for the desktop: no session bus, no
+compositor, and the test runs in CI.
+
+Run:  python3 test_hotkey_rebind.py
 """
-import ctypes
+import os
 import queue
 import sys
-import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # the project root
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ (autocheck)
-from hotkeys import (DEFAULT_BINDINGS, HotkeyController,  # noqa: E402
-                     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, build_bindings)
+os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-user32 = ctypes.windll.user32
-# A combination that is certainly free, so we do not fight the system.
-PROBE_ID = 900
-PROBE_MODS = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT
-VK_F6 = 0x75
+import hotkeys  # noqa: E402
 
 
-def can_grab(mods: int, vk: int) -> bool:
-    """Could the combination be registered from THIS thread?
+class FakeSession:
+    """A GlobalShortcuts session that binds whatever it is asked for.
 
-    If yes, nobody is holding it. We release it straight away.
+    `assigned` is what the desktop decided, which is deliberately not what
+    was requested for one of the shortcuts: that is the case the menu has to
+    render honestly.
     """
-    if user32.RegisterHotKey(None, PROBE_ID, mods, vk):
-        user32.UnregisterHotKey(None, PROBE_ID)
+
+    def __init__(self, on_activated):
+        self.on_activated = on_activated
+        self.bound: list = []
+        self.assigned: dict = {}
+        self.closed = False
+
+    def open(self):
         return True
-    return False
+
+    def bind(self, shortcuts, timeout=0):
+        self.bound = list(shortcuts)
+        self.assigned = {ident: trigger for ident, _d, trigger in shortcuts}
+        # The desktop refuses one and substitutes another, which is exactly
+        # what a compositor with a conflicting binding does.
+        if "settings" in self.assigned:
+            self.assigned["settings"] = "SUPER+m"
+        return True
+
+    def current(self):
+        return dict(self.assigned)
+
+    def close(self):
+        self.closed = True
 
 
 def main() -> int:
     failures = []
     commands: queue.Queue = queue.Queue()
+    made: list = []
 
-    # Our bindings: a single combination, so the probe is unambiguous.
-    bindings = {1: (PROBE_MODS, VK_F6, "toggle", "Ctrl+Alt+F6")}
-    if not can_grab(PROBE_MODS, VK_F6):
-        print("SKIP: Ctrl+Alt+F6 is already taken - the probe is unreliable")
-        return 0
+    real_session = hotkeys.portal.ShortcutsSession
+    hotkeys.portal.ShortcutsSession = lambda cb: made.append(
+        FakeSession(cb)) or made[-1]
+    try:
+        bindings = hotkeys.build_bindings()
+        hk = hotkeys.HotkeyController(commands, bindings)
+        hk.start(labels={"toggle": "Neural Rendering on/off"})
 
-    hk = HotkeyController(commands, bindings)
-    hk.start()
-    print(f"start: registered={hk.registered} failed={hk.failed}")
-    if "Ctrl+Alt+F6" not in hk.registered:
-        failures.append("it did not register at startup")
-    if can_grab(PROBE_MODS, VK_F6):
-        failures.append("the combination is free although the controller took it")
+        if hk.backend != "portal":
+            failures.append(f"backend is {hk.backend!r}, expected 'portal'")
+        session = made[-1]
 
-    hk.suspend()
-    time.sleep(0.4)
-    if not can_grab(PROBE_MODS, VK_F6):
-        failures.append("the combination is still taken after suspend")
-    else:
-        print("suspend: the combination was released")
+        # 1. The descriptions reach the desktop's shortcut editor: that is
+        #    what the user reads there, so it has to be the localised name
+        #    and not the internal command id.
+        described = dict((ident, text) for ident, text, _t in session.bound)
+        if described.get("toggle") != "Neural Rendering on/off":
+            failures.append(f"the description sent for 'toggle' was "
+                            f"{described.get('toggle')!r}")
 
-    hk.resume()
-    time.sleep(0.4)
-    if can_grab(PROBE_MODS, VK_F6):
-        failures.append("the combination was not taken back after resume")
-    else:
-        print("resume: the combination is taken again")
+        # 2. The preferred trigger is in the portal's own syntax.
+        triggers = {ident: trigger for ident, _d, trigger in session.bound}
+        if triggers.get("toggle") != "KP_1":
+            failures.append(f"toggle's preferred trigger is "
+                            f"{triggers.get('toggle')!r}, expected 'KP_1'")
+        if triggers.get("quit") != "CTRL+ALT+q":
+            failures.append(f"quit's preferred trigger is "
+                            f"{triggers.get('quit')!r}, expected 'CTRL+ALT+q'")
 
-    # Remapping: from F6 to F5
-    VK_F5 = 0x74
-    if not can_grab(PROBE_MODS, VK_F5):
-        print("SKIP: Ctrl+Alt+F5 is taken - the rebind part is skipped")
-    else:
-        hk.rebind({1: (PROBE_MODS, VK_F5, "toggle", "Ctrl+Alt+F5")})
-        time.sleep(0.5)
-        print(f"after rebind: registered={hk.registered}")
-        if "Ctrl+Alt+F5" not in hk.registered:
-            failures.append("the new combination is not registered")
-        if can_grab(PROBE_MODS, VK_F5):
-            failures.append("the new combination is free - rebind did not work")
-        if not can_grab(PROBE_MODS, VK_F6):
-            failures.append("the old combination stayed taken after the rebind")
-        else:
-            print("rebind: the old one was released, the new one is taken")
+        # 3. effective() reports the desktop's answer, not ours.
+        if hk.effective().get("settings") != "SUPER+m":
+            failures.append("effective() does not report what the desktop "
+                            "actually bound - the menu would show our wish")
 
-    hk.stop()
-    time.sleep(0.4)
-    if not can_grab(PROBE_MODS, VK_F5) and not can_grab(PROBE_MODS, VK_F6):
-        failures.append("the combinations were not released after stop")
+        # 4. An activation reaches the queue.
+        session.on_activated("toggle")
+        if commands.get_nowait() != "toggle":
+            failures.append("an activation did not reach the command queue")
 
-    # build_bindings from the config: command name -> string
-    over = build_bindings({"toggle": "Ctrl+Shift+K"})
-    got = next(b for b in over.values() if b[2] == "toggle")
-    print(f"build_bindings: toggle -> {got[3]}")
-    if got[3] != "Ctrl+Shift+K":
-        failures.append(f"the config override was not applied: {got}")
-    # The rest must stay at their defaults
-    if len(over) != len(DEFAULT_BINDINGS):
-        failures.append("the override lost some of the bindings")
+        # 5. Suspended, it does not.
+        hk.suspend()
+        session.on_activated("toggle")
+        if not commands.empty():
+            failures.append("a suspended controller still delivered a command")
+
+        # 6. Resumed, it does again.
+        hk.resume()
+        session.on_activated("toggle")
+        if commands.get_nowait() != "toggle":
+            failures.append("resume did not restore delivery")
+
+        # 7. A rebind reaches the backend with the new trigger.
+        rebound = hotkeys.build_bindings({"toggle": "F10"})
+        hk.rebind(rebound, labels={"toggle": "Neural Rendering on/off"})
+        triggers = {ident: trigger for ident, _d, trigger in session.bound}
+        if triggers.get("toggle") != "F10":
+            failures.append(f"after the rebind toggle's trigger is "
+                            f"{triggers.get('toggle')!r}, expected 'F10'")
+
+        # 8. Stopping closes the session: a shortcuts session left open is a
+        #    program the desktop still thinks owns those keys.
+        hk.stop()
+        if not session.closed:
+            failures.append("stop() left the shortcuts session open")
+    finally:
+        hotkeys.portal.ShortcutsSession = real_session
 
     if failures:
+        print("FAIL:")
         for f in failures:
-            print("FAIL:", f)
+            print(f"  - {f}")
         return 1
-    print("OK: suspend/resume/rebind work on live hotkeys")
+    print("OK: descriptions, triggers, suspend/resume, rebind, honest "
+          "effective()")
     return 0
 
 
