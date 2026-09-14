@@ -33,7 +33,7 @@ BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
 
 # The dev-only scripts at the root (_probe_*, _measure_*, the release
 # tooling) are not part of the program and are allowed to import main.
-SKIP = {"build_release_zip.py", "verify_github.py", "test_bake_menu.py"}
+SKIP = {"build_release.py", "verify_github.py", "test_bake_menu.py"}
 
 
 def app_modules() -> list:

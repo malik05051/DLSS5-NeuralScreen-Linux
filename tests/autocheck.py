@@ -11,7 +11,6 @@ import json
 import os
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent  # the project root (tests/ lives inside it)
@@ -107,9 +106,12 @@ def archive_integrity():
     """The release tarball has everything and its sources are the committed ones."""
     import tarfile
 
-    matches = sorted(ROOT.glob("neuralscreen-v*-full.tar.xz"))
+    from settings_io import APP_VERSION
+
+    matches = sorted(ROOT.glob(f"neuralscreen-v{APP_VERSION}-full.tar.xz"))
     if not matches:
-        return False, "no neuralscreen-v*-full.tar.xz (build_release_zip.py)"
+        return False, (f"no neuralscreen-v{APP_VERSION}-full.tar.xz "
+                       "(build_release.py)")
     apath = matches[-1]
     required = [
         "main.py", "gpuinfo.py", "overlay_ui.py", "i18n.py", "recorder.py",
@@ -193,20 +195,21 @@ def archive_integrity():
         if leak:
             return False, "a personal config in the archive: " + ", ".join(leak)
         # VERSION.txt must tell the truth (audit 10.09 H1): the commit is
-        # HEAD, the runtime sha matches the DLL inside, and the version
+        # HEAD, the runtime sha matches the snippet inside, and the version
         # matches the file name. A manifest that lies is worse than none.
-        vt = z.read("VERSION.txt").decode("utf-8", "replace")
+        vt = read("VERSION.txt").decode("utf-8", "replace")
         head = subprocess.check_output(["git", "rev-parse", "HEAD"],
                                        cwd=ROOT, text=True).strip()
         if f"commit: {head}" not in vt:
             return False, "VERSION.txt commit != HEAD - rebuilt from a dirty tree?"
-        zip_dll = z.read("native/nvngx_dlssnr.dll")
-        zsha = hashlib.sha256(zip_dll).hexdigest()
-        if f"sha256 {zsha}" not in vt:
-            return False, "VERSION.txt runtime sha != the DLL inside the archive"
-        if "NeuralScreen 1.8.2" not in vt:
-            return False, "VERSION.txt version does not match v1.8.2"
-    return True, f"{zpath.stat().st_size} bytes, all files, the hook, a default config, a truthful manifest"
+        snippet_sha = hashlib.sha256(read("native/nvngx_dlssnr.so")).hexdigest()
+        if f"sha256 {snippet_sha}" not in vt:
+            return False, ("VERSION.txt runtime sha != the nvngx_dlssnr.so "
+                           "inside the archive")
+        if f"NeuralScreen {APP_VERSION}" not in vt:
+            return False, f"VERSION.txt version does not match v{APP_VERSION}"
+    return True, (f"{apath.stat().st_size} bytes, all files, WGCW, "
+                  "a default config, a truthful manifest")
 
 
 def gpuinfo_works():

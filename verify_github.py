@@ -10,7 +10,7 @@ GitHub actually serves. This script checks, for the current version:
 4. the repository description carries the current feature markers
 
 Usage:  runtime\\python.exe verify_github.py [tag]
-        (tag defaults to the version in build_release_zip.py)
+        (tag defaults to the version in build_release.py)
 
 Exit code 0 = everything on GitHub matches the local tree.
 """
@@ -72,11 +72,11 @@ def _fetch_asset(asset_id: int, dest: Path) -> bool:
 
 
 def main() -> int:
-    # Read VERSION from the source text - importing build_release_zip would
+    # Read VERSION from the source text - importing build_release would
     # EXECUTE the build (it is a script, not a module) and rebuild the zip,
     # changing its digest (VERSION.txt carries a build timestamp).
     import re
-    src = (ROOT / "build_release_zip.py").read_text(encoding="utf-8")
+    src = (ROOT / "build_release.py").read_text(encoding="utf-8")
     m = re.search(r'^VERSION = "([^"]+)"', src, re.M)
     version = m.group(1) if m else "?"
     tag = sys.argv[1] if len(sys.argv) > 1 else f"v{version}"

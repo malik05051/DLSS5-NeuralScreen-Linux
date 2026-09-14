@@ -4,50 +4,75 @@ How it works, what was measured, and why the decisions went the way
 they did. For installing and using the program see
 [README.md](README.md).
 
-Every number here was measured on this machine - RTX 5070 Ti, driver
-616.56, Windows 11 - and says so where it matters. Where an earlier
-conclusion turned out to be wrong, the correction is kept rather than
-quietly edited out: the mistakes are the useful part.
+Every number here was measured on an RTX 5070 Ti at 4K and says so where it
+matters. The numbers were taken on the Windows build, on the same card, and
+are kept: the parts they measure - the network, the residual composite, the
+colour conversion in the recorder - are the same code doing the same work
+on the same GPU. Where the port changes what a number would be, it says so.
+Where an earlier conclusion turned out to be wrong, the correction is kept
+rather than quietly edited out: the mistakes are the useful part.
 
-## One window: Windows Graphics Capture (WGCW)
+This is a port of a Windows program, and the interesting half of it is
+which things had counterparts and which did not. **What did not come
+across** is a section near the end, not a footnote.
 
-`Num5` swaps the input from Desktop Duplication of the whole screen to
-Windows Graphics Capture of one window. Both sources hand the worker the same
-kind of `ID3D11Texture2D`, so everything downstream - the NT-shared texture,
-the fence, the BGRA->RGBA swizzle, the luminance channel for the guides - is
-the same code.
+## One window: a portal stream
 
-Why it matters, measured rather than assumed:
+`Num5` swaps the input from the whole screen to one window. On Windows that
+was a swap of one capture API for another - Desktop Duplication for Windows
+Graphics Capture - and both handed the worker the same kind of
+`ID3D11Texture2D`, so everything downstream was shared code.
 
-* A per-window capture is unaffected by what is drawn on top of the window. A
-  fullscreen overlay covering the target contributes **0.0%** of the captured
-  pixels while the window's own content is **100%**. No self-capture loop.
-* So `WDA_EXCLUDEFROMCAPTURE` comes off in this mode, and that is the whole
-  point: with it on, the NVIDIA App writes **no file at all** (0 out of 4
-  attempts); in one-window mode it recorded 26.1 MB of the same desktop.
-* The yellow "this window is being captured" border can be turned off.
-  `GraphicsCaptureSession.IsBorderRequired = false` takes effect for an
-  unpackaged process on Windows 11 26200 even though
-  `GraphicsCaptureAccess.RequestAccessAsync(Borderless)` answers
-  `UserPromptRequired`. Measured against a control run: 12 yellow pixels in
-  the ring around the window with the capture on, 12 with it off.
+Here there is nothing to swap. A monitor and a window are both a PipeWire
+node granted by the portal, and the only difference is which one the user
+picked. `DDA1` and `WGCW` survive as separate messages because the pipeline
+around them differs - a window's size is not the screen's, and the overlay
+follows it - but the worker's side of both is `pw_stream_connect` on a node
+id.
 
-Sizes are **physical pixels**. `WGCW` is acknowledged with the size the
-capture really produces, and the pipeline is rebuilt for exactly that - a
-window's logical size on a scaled display is a different number, and
-`GetWindowRect` is a third one (it includes the invisible resize border). The
-overlay is placed by `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`,
-which is the rectangle the capture agrees with.
+What that costs, and what it buys:
 
-The capture is event-driven: a window that does not redraw produces one frame
-and then nothing, exactly like `DXGI_ERROR_WAIT_TIMEOUT` on the duplication
-path. The worker keeps the last frame.
+* **The user picks the window, not the program.** A Wayland client cannot
+  enumerate other clients' windows, point at one, or raise it. The Windows
+  build did all three: it listed every window with `EnumWindows`, took the
+  one under the cursor with `WindowFromPoint`, and brought it to the front
+  before capturing. None of that is possible and none of it should be. The
+  compositor's own picker replaces the lot, and `restore_token` means it
+  appears once rather than every launch.
 
-A resize reconfigures the running worker over `RNSZ` - new capture size, new
-shared memory, new textures, same process - and still waits half a second for
-the size to settle first. It used to replace the worker, which cost 1.845 s and
-a veil over the picture; in place it is 0.112 s and nothing goes dark. A move
-only moves the windows.
+* **A per-window capture is still unaffected by what is drawn on top.** The
+  compositor renders the window's own content, not the screen region it
+  occupies, so there is no self-capture loop - the same property the
+  Windows build measured (0.0% of the captured pixels came from a
+  fullscreen overlay covering the target).
+
+* **The overlay no longer has to hide.** On Windows the whole reason this
+  mode existed was that `WDA_EXCLUDEFROMCAPTURE` - needed so Desktop
+  Duplication would not eat our own output - also hid the overlay from OBS
+  and stopped the NVIDIA App recording anything at all (0 files out of 4
+  attempts). Window mode dropped the flag to get around it. Here the flag
+  has no counterpart and needs none: the overlay is a layer surface, the
+  compositor composites it, and an external recorder sees exactly what the
+  user sees. One whole class of workaround is gone rather than ported.
+
+Sizes are **physical pixels**, and the worker is asked rather than guessed
+at: `WGAK` carries the size the stream really produces, and the pipeline is
+rebuilt for exactly that. A window's logical size on a scaled display is a
+different number, and its frame is a third one. That lesson is the Windows
+build's and it survived the port unchanged.
+
+Following the window as it moves needs the compositor to say where it is,
+which is a privilege and not a right. sway and Hyprland answer over their
+own IPC sockets (`toplevels.py` speaks both directly rather than shelling
+out to `swaymsg` or `hyprctl`); nothing else does. Where the answer is not
+available the overlay stays on the screen and the picture is drawn in
+place - `toplevels.geometry_source()` is what the rest of the program asks
+so it can say which it got instead of silently doing nothing.
+
+A resize reconfigures the running worker over `RNSZ` - new size, new shared
+memory, same process - and still waits half a second for the size to
+settle first. It used to replace the worker, which cost 1.845 s and a veil
+over the picture; in place it is 0.112 s and nothing goes dark.
 
 ## Recording (Num0)
 
@@ -75,25 +100,29 @@ only moves the windows.
   caption.
 - Recording works in both NR ON and NR OFF (bypass) modes; the file duration
   matches real time (PTS is built from the wall clock).
-- **External recorders see the picture through Spout2** (off by default,
-  toggled in the settings): the worker publishes its output as a Spout2
-  shared texture, so OBS with the Spout2 Capture plugin records the
-  processed picture in full-screen mode too — where `WDA_EXCLUDEFROMCAPTURE`
-  hides the overlay from a screen capture. The NVIDIA App has no Spout
-  input; its path is one-window mode, which drops the WDA flag. The bridge
-  is initialised once per worker process (`NS_SPOUT`), so toggling it
-  restarts the worker.
-- **System audio is recorded as a second track**: WASAPI loopback ("what you
-  hear") from the default playback device, AAC 192 kbit/s stereo at the
-  endpoint's own rate. No virtual cable, no microphone. Turn it off with
-  `"record_audio": false` in `config.json`. A machine without a playback
-  endpoint still records video — the sound is best-effort and never stops the
-  recording.
+- **External recorders need nothing special.** An ordinary OBS Screen
+  Capture (PipeWire) source on the same monitor sees the processed picture,
+  because the compositor composites the overlay rather than hiding it. On
+  Windows this whole paragraph was about a Spout2 bridge, needed because
+  `WDA_EXCLUDEFROMCAPTURE` hid the overlay from every screen capture; see
+  "What did not come across" for the switch that survives it.
+- **System audio is recorded as a second track**: the default sink's
+  PipeWire monitor ("what you hear"), AAC 192 kbit/s stereo. No virtual
+  cable, no microphone. Turn it off with `"record_audio": false` in
+  `config.json`. A machine with no sound server still records video — the
+  sound is best-effort and never stops the recording.
 
-  While nothing is playing at all, WASAPI loopback hands back no data rather
-  than silence, so quiet stretches are padded from the same clock the video
-  uses. Without that the audio track would simply be shorter than the video
-  and everything after a pause would be out of sync.
+  The source is `@DEFAULT_MONITOR@`, which follows the default sink, so
+  plugging in headphones mid-recording keeps recording. Where the server
+  does not honour the alias the name is looked up with `pactl`.
+
+  The padding for quiet stretches is kept even though the trap it was
+  written for is a Windows one: WASAPI loopback handed back *no* data while
+  nothing was playing, not silence, so a recorder that concatenated what it
+  got ended up with audio shorter than the video. A PipeWire monitor
+  produces silence at the rate it promised. The padding costs nothing when
+  there is nothing to pad, and the one thing worse than an audio track that
+  drifts is one that drifts only on some machines.
 
 ### What recording costs, and why it is not the bitrate
 
@@ -131,82 +160,158 @@ not.
 
 | Field | Meaning |
 |---|---|
-| `monitor` | monitor index for capture |
+| `monitor` | the monitor to capture, by connector name (`"DP-1"`); an integer index is accepted and rewritten on first save |
 | `width`, `height` | output resolution (**actual monitor resolution is used automatically when config is stale**) |
-| `fullscreen` | borderless fullscreen window |
+| `fullscreen` | kept for the config's shape; the overlay is a layer surface and is always the size of its output |
 | `warmup` | NGX warmup frames at start |
 | `work_scale` | 0.1–1.0, the resolution the network runs at, relative to the screen. Only has an effect with `nr_small` on |
 | `nr_small` | process at a reduced resolution and compose the result onto the native frame: faster, sharp (the residual composite). Default `false` |
 | `profile` | `Faithful`, `Natural`, `Strong / Cinematic`, `Extreme / Overdrive` |
 | `intensity`, `local_tone`, `local_structure`, `skin_structure` | `null` = take from profile |
-| `lang` | `ru` / `en` |
-| `worker_present` | worker shows the frame in its own window (`false` — pygame output) |
+| `lang` | `en`, `ru`, `fr`, `de`, `es`, `it`, `pt`, `pl`, `uk`, `zh`, `ja`, `ko` |
+| `restore_token`, `window_token` | what the portal gave back so the screen and window pickers do not appear again. Written by the app; deleting one asks you again |
+| `spout` | publish the result as a PipeWire source — **not implemented in this build**, see "What did not come across" |
+| `worker_present` | **has no effect**: the worker cannot present its own surface here, see Architecture |
 | `motion_on_gpu` | worker upscales the motion field (`false` — CPU) |
-| `capture_in_worker` | worker captures the desktop itself (DDA, `false` — dxcam in Python) |
+| `capture_in_worker` | the worker reads the granted PipeWire stream itself (`false` — Python reads it through GStreamer, which is the slower fallback) |
 | `pixels_in_shm` | result pixels come back through a shared section instead of the pipe (`false` — pipe, as before) |
 | `split` | 0–1, share of the frame left unprocessed for the before/after wipe; 0 — off |
 | `theme` | `light` / `dark` |
 | `open_menu_on_start` | open the menu on launch; `false` — a short alert instead |
-| `hotkeys` | `{"toggle": "Num1", ...}` — see README, "Using it". Names: `Num0`-`Num9`, `Numdot`, `Numplus`, `Numminus`, `Nummul`, `Numdiv`, `F1`-`F12`, `Insert`, `Home`, letters, digits, with `Ctrl+`/`Alt+`/`Shift+` |
+| `hotkeys` | `{"toggle": "Num1", ...}` — a *preference* handed to the compositor, not a binding. Names: `Num0`-`Num9`, `Numdot`, `Numplus`, `Numminus`, `Nummul`, `Numdiv`, `F1`-`F12`, `Insert`, `Home`, letters, digits, with `Ctrl+`/`Alt+`/`Shift+`. What was actually bound is what the menu shows |
 | `menu_offset`, `menu_scale`, `menu_height` | where the menu sits, its scale and height. Written by the app, not meant to be edited by hand (`menu_height: null` — fit the content) |
 
 ## Architecture
 
-Two processes. Python drives settings, optical-flow guides and the menu
-layer; the C++ worker owns the D3D12 device, the capture, NGX and the
-overlay window.
-They talk over stdin/stdout with a binary protocol:
+Two processes, and the split is the Windows build's because the split was
+never about Windows. Python drives the settings, the optical-flow guides
+and the menu layer; the C++ worker owns the GPU device, the capture, NGX
+and nothing else. They talk over stdin/stdout with a binary protocol whose
+messages did not change:
 
 | Message | Purpose |
 |---|---|
 | `D5V3` | stream header: sizes, profile, NR parameters |
-| `SHMI` / `SACK` | shared-memory section name for the input frame |
-| `WNDO` / `WACK` | raise/close the worker's output window |
-| `MOTS` / `MACK` | motion arrives at reduced size, worker upscales it on GPU |
-| `DDA1` / `DACK` | worker takes over capture (Desktop Duplication), colour never touches the CPU |
-| `GRAY` / `GAK` | worker writes AREA-downsampled luminance (320×180) into a back-mapping for the guides |
-| `FRM1` | frame: header, then either payload (RGBA8 + motion) or "in shared memory" flag |
-| `OUT1` | result: RGBA8 full-res, or `bytes=0` — the worker already presented it |
+| `SHMI` / `SACK` | shared-memory name for the input frame |
+| `WNDO` / `WACK` | the worker presents in its own surface — **refused here**, see below |
+| `MOTS` / `MACK` | motion arrives at reduced size, worker upscales it on the GPU |
+| `DDA1` / `DACK` | worker reads the granted screen stream; colour never touches the CPU |
+| `WGCW` / `WGAK` | the same for a window stream, by PipeWire node id |
+| `GRAY` / `GAK` | worker writes downsampled luminance (320×180) back for the guides |
+| `FRM1` | frame: header, then a payload or an "in shared memory" flag |
+| `OUT1` | result: RGBA8 full-res, or `bytes = 0xFFFFFFFF` — it went to a section |
 | `RNSZ` / `RACK` | change work resolution on the fly, no process restart |
-| `OUTS` / `OAK2` | named section the worker writes result pixels into; the reply then carries `bytes = 0xFFFFFFFF` instead of a payload |
+| `OUTS` / `OAK2` | named section the worker writes result pixels into |
 
-**Capture.** On `DDA1` the worker opens Desktop Duplication on the GPU: each
-frame is copied into a cross-device shared texture and swizzled to RGBA.
-Python stops capturing entirely — `grab` and `guides` drop to 0.1 ms.
-Fallback (dxcam + full-frame send) stays intact.
+Two fields changed meaning rather than shape, which is why the wire format
+is untouched: `WGCW`'s 64-bit handle was an `HWND` and is a PipeWire node
+id, and the shared-memory names are `shm_open` names rather than
+`CreateFileMapping` names. Both were always opaque to everything between
+Python and the worker.
+
+**Capture.** Python negotiates with the portal and inherits the PipeWire
+remote as a file descriptor; `DDA1` tells the worker to start reading it.
+The descriptor reaches the worker the only way one crosses a process
+boundary here — inherited, with the number in `NS_PW_FD` — because a file
+descriptor cannot travel down a pipe as an integer. A worker that could
+open its own capture would be a worker that could capture without the user
+having agreed.
+
+**Shared memory.** `CreateFileMapping`/`OpenFileMapping` became
+`shm_open` on both sides, which is the same shape under a different
+spelling. One thing is better: the segment is unlinked as soon as both
+sides have mapped it, so a crash cannot leave 33 MB in `/dev/shm`. A
+Windows section could not do that either, and it is the one property worth
+keeping deliberately rather than by accident.
 
 **Guides.** The optical flow needs a small gray frame. On `GRAY` the worker
-computes it with an honest block average (12×12 per cell at 4K → 320×180,
-matching `cv2.INTER_AREA`; bilinear would alias text and break the flow) and
-writes it into a named mapping. No 4K frame ever crosses the CPU.
+blits the colour image down and reduces it to Rec. 709 luma in integers,
+then writes it into the section. No 4K frame ever crosses the CPU.
 
-**Output.** On `WNDO` the worker raises its own borderless D3D12-swapchain
-window across the screen and presents the NGX result itself: pixels never
-return to Python. The pygame window stays as the menu layer — its background
-is filled with a chroma key and made transparent (`LWA_COLORKEY`). While the
-menu is open the window's global alpha (`LWA_ALPHA`) goes to 255, otherwise
-the bright frame underneath bleeds through the panel.
+**Output.** `WNDO` is answered with a refusal, and that is a real
+difference. On Windows the worker raised its own borderless D3D12-swapchain
+window and presented the NGX result itself, so the pixels never returned to
+Python — the overlay was reduced to a chroma-keyed menu layer on top. Two
+surfaces from two processes cannot be stacked against each other on
+Wayland: neither client can order itself relative to the other, and only
+the compositor may. So the overlay presents, which is one surface and one
+authority over what is on top. The pixels come back through the `OUTS`
+section, which is the path the recorder already used.
 
-**NR off (bypass).** `Num1` does not stop the pipeline anymore. Frames are
-sent with `FRAME_FLAG_BYPASS`: the worker skips the NGX evaluate and
-presents the raw capture instead. The overlay stays alive; everything is
-hidden only on real exit.
+The chroma key went with it. A layered window has one global alpha and no
+per-pixel one, so HUD mode filled its background with a magenta that could
+not occur in the palette and let Windows punch exactly that colour out —
+with a careful note about why the panel's translucency had to come from the
+window's global alpha rather than from its pixels (a blended magenta is not
+the key colour, and the key does not cut out a blend; it came out as a pink
+slab). A `wl_surface` carries real per-pixel alpha. The background is
+transparent, the panel's own alpha does what it says, and `LWA_ALPHA`
+survives only as one number folded into the alpha channel at present time.
 
-**Recording path.** Frames are requested from the worker with
-`FRAME_FLAG_WANT_PIXELS` (the same mechanism as screenshots), the open menu
-is drawn onto the frame with `draw_capture_overlay()`, then PyAV encodes
-AV1 NVENC.
+**NR off (bypass).** `Num1` does not stop the pipeline. Frames are sent
+with `FRAME_FLAG_BYPASS`: the worker blits the capture to the output
+instead of evaluating. Recording and screenshots keep working, which is why
+it is a copy rather than a shortcut that returns nothing.
 
-Two constraints that look like quirks but are mandatory:
+**Recording path.** Frames are requested with `FRAME_FLAG_WANT_PIXELS`, the
+open menu is drawn onto the frame with `draw_capture_overlay()`, then PyAV
+encodes AV1 NVENC — unchanged, because ffmpeg's nvenc is the same encoder
+on both systems.
 
-- **The worker binary must be named `nvngx.dll`.** NGX Core returns
-  `FAIL_PlatformError` on `Init_Ext` for any other process name. Verified
-  experimentally.
-- **Work resolution is capped at 2560×1440.** At 4K the feature 18 goes
-  silent: the worker hangs on frame zero in both legacy and upscale modes.
+Two constraints that look like quirks:
 
-Scale changes go through `RNSZ` (~60 ms, the worker recreates the NGX
-feature in-process). If `RNSZ` fails — fall back to a full worker restart.
+- **Work resolution is capped at 2560×1440.** At 4K feature 18 goes silent
+  and the worker hangs on frame zero. The Windows build measured this; the
+  cap is in the protocol header on both.
+- **The worker no longer has to be called `nvngx.dll`.** NGX Core returned
+  `FAIL_PlatformError` from `Init_Ext` for any other process name on
+  Windows, which is why the Windows binary was a disguised DLL. There is no
+  such check here: the binary is `neuralscreen-host` and NGX loads the
+  snippet out of the application path it is given.
+
+Scale changes go through `RNSZ` (~60 ms, the feature is recreated
+in-process). If `RNSZ` fails, the pipeline falls back to a full restart.
+
+### The overlay, flag by flag
+
+The overlay was four Win32 extended styles. Three have exact counterparts
+and they are protocol rather than flags:
+
+| Windows | Wayland |
+|---|---|
+| `WS_EX_TOPMOST` | `zwlr_layer_shell_v1`, layer = overlay |
+| `WS_EX_TRANSPARENT` + `WS_EX_LAYERED` | `wl_surface.set_input_region(empty)` |
+| `WS_EX_NOACTIVATE` | `keyboard_interactivity = none` |
+| the menu, open | `keyboard_interactivity = exclusive`, full input region |
+
+Click-through is the clearest example of the trade. On Windows it took
+three calls in a mandatory order — the style bits, then
+`SetLayeredWindowAttributes` to actually activate layered mode, then
+`SetWindowPos(SWP_FRAMECHANGED)` to drop the style cache — a sequence
+arrived at by diagnostics, because `WS_EX_TRANSPARENT` alone does nothing.
+Here it is one request, and an empty input region means exactly what it
+says.
+
+Three things that were code on Windows are now nothing at all:
+
+* **Re-asserting topmost every thirty frames.** A borderless game asked for
+  topmost too, and whoever asked last won, so the HUD vanished under
+  Cyberpunk until the next re-assert — and re-asserting every frame made
+  DWM flicker. A layer surface on the overlay layer is above every ordinary
+  surface by protocol. There is no race to win.
+* **Stealing focus with `AttachThreadInput`.** The system refuses
+  `SetForegroundWindow` to a process the user has not interacted with, so
+  opening the menu over a game needed the foreground thread's input state
+  attached to ours to make the activation look user-initiated. A layer
+  surface asks the compositor for the keyboard and gives it back; the game
+  never loses its own focus.
+* **`SetCapture` while dragging the panel.** Without it a drag died the
+  moment the cursor left the window. Wayland grants an implicit pointer
+  grab for as long as a button is down.
+
+And one thing that was impossible is now free: the overlay is anchored to
+an output rather than positioned on a virtual desktop, so it cannot land on
+the wrong monitor. Issues #28, #33 and #35 were all that mistake.
 
 ## Performance
 
@@ -366,52 +471,127 @@ before pixels are handed back, so the wipe lands in recordings and
 screenshots by itself. The position rides in the top 16 bits of the frame
 header's flag field, so moving the slider does not recreate the worker.
 
-## Older GPUs (20/30/40-series)
+## What did not come across
 
-`nvngx_dlssnr.dll` refuses to create the feature on anything below Blackwell.
-Its own version resource says `NGXGpuArchitecture = NVSDK_NGX_GPU_Arch_Blackwell2`,
-and it carries the message
+Three things the Windows build had and this one does not. Each is here
+because a known gap is not the same thing as a bug report.
+
+### The architecture spoof — gone, and pre-Blackwell cards with it
+
+`nvngx_dlssnr` refuses to create the feature on anything below Blackwell.
+Its own version resource says
+`NGXGpuArchitecture = NVSDK_NGX_GPU_Arch_Blackwell2`, and it carries the
+message
 
 ```
 DLSSNR: Unsupported GPU architecture 0x%x, minimum required 0x%x
 ```
 
-The bundled build is the leaked **310.8.0** runtime (from the
-RankFTW/rhi-repo mirror): parsing its fatbin headers shows `sm_75/86/89/120`
-kernels - the universal build. The architecture hook (below) makes the
-feature create succeed on non-Blackwell cards; the refusal on cards the
-kernels cannot run on (Turing) is a policy check, not missing code.
+The bundled build is the leaked **310.8.0** runtime: parsing its fatbin
+headers shows `sm_75/86/89/120` kernels — the universal build. The refusal
+on cards those kernels *can* run on is a policy check, not missing code,
+which is why getting past it worked at all.
 
-The library learns the architecture through nvapi — it loads `nvapi64.dll`,
-takes its single export `nvapi_QueryInterface` and asks for
-`NvAPI_GPU_GetArchInfo` by id. The worker patches that one function in **its
-own process memory** at startup: the prologue is saved, replaced with a jump
-to our handler, and restored around every real call, so any GPU handle is
-still served by NVIDIA's own code — only the returned architecture is
-rewritten to Blackwell. Nothing in NVIDIA's files is modified, and on a
-50-series card the hook disables itself and does nothing.
+The Windows build got past it by patching one function. The library learns
+the architecture through nvapi — it loads `nvapi64.dll`, takes its single
+export `nvapi_QueryInterface` and asks for `NvAPI_GPU_GetArchInfo` by id.
+The worker patched that function in its own process memory: prologue saved,
+replaced with a jump to our handler, restored around every real call, so
+NVIDIA's own code still served every GPU handle and only the returned
+architecture was rewritten. It was confirmed working on a 40-series card by
+a user who ran it.
 
-**On by default** (set `NS_ARCH_SPOOF=0` to disable). **Confirmed working on
-a 40-series card** by a user who ran it; 20- and 30-series are still
-unverified. Nothing here can test any of them — the only card on this machine
-is a 5070 Ti, where the hook disables itself by design. The menu's GPU dot
-tells you the truth either way: it goes green only when the worker actually
-created feature 18, not when the architecture merely looks right.
+None of that transfers. The hook depended on nvapi being a Windows DLL with
+one dispatch export, on a call site in a module we could identify, and — in
+the forwarder that went with it — on the Windows loader's rule that a call
+returns to a named module. The Linux runtime asks the driver a different
+way, through a library whose internals nobody here has inspected, and
+inventing an interposition against an API this port has not read would be
+guessing in a place where guessing wrong looks like a crash in NVIDIA's
+code.
 
-This likely conflicts with the license terms of NVIDIA's redistributable. It
-defeats no copy protection and modifies no files, but enabling it is your
-call.
+So the honest state is: **Blackwell only.** The menu's GPU dot still tells
+the truth — it goes green when the worker actually created feature 18, not
+when the architecture merely looks right — and `gpuinfo.py` derives the
+verdict from the compute capability, which is the same information nvapi's
+architecture id carried.
+
+This is the single biggest thing the port lost. It is also the one whose
+absence is easiest to be sure about, because it is a policy check with a
+published error message.
+
+### PipeWire output — the switch exists, the worker does not implement it
+
+Spout2 is a Windows mechanism: a shared DirectX texture published under a
+name, read by an OBS plugin. The idea's Linux counterpart is exact — a
+PipeWire video source node, which OBS reads with no plugin — and the config
+key, the environment variable and the menu row all survive under their old
+names so an existing config keeps working.
+
+The worker does not publish one yet. It reads `NS_SPOUT` at startup and
+logs that it was asked and cannot, rather than letting the setting appear
+to do nothing.
+
+It matters less than it did. Spout existed on Windows because the overlay
+had to hide from screen capture, so an external recorder could not see the
+picture at all; here an ordinary OBS Screen Capture source on the same
+monitor sees exactly what the user sees.
+
+### The worker has never run against hardware
+
+The C++ half was rewritten from D3D11/D3D12 to Vulkan: the device, the
+image imports, the NGX feature and the PipeWire consumer. It compiles, and
+`neuralscreen-host --probe` fails cleanly on a machine with no NVIDIA
+device. It has not been run on a machine with one.
+
+The parts most likely to need work are named here so nobody has to find
+them by bisection:
+
+* **dmabuf import.** `Device::import_dmabuf` is written and the extensions
+  are queried for, but the capture callback currently copies through
+  memory instead of using it. Zero-copy needs the imported image to outlive
+  the PipeWire callback, which means a fence per buffer rather than a
+  memcpy. The copy is what the Windows GDI fallback cost, on a path that
+  used to cost nothing.
+* **Image formats.** The colour and output images are
+  `R16G16B16A16_SFLOAT` on the reasoning that the feature's tone mapping
+  works in a wider range than the frame arrives in. The Windows host's
+  choice here was not read back before deciding.
+* **The NGX resource layout.** `VK_IMAGE_LAYOUT_GENERAL` is used for
+  everything NGX binds, on the grounds that it binds storage images and is
+  not told what we would have preferred. If NGX wants something else it
+  will say so in `FAIL_InvalidParameter` rather than silently.
 
 ## Building the worker
 
 ```
-native\build-host.bat
+native/linux/build-host.sh
 ```
 
-Requires MSVC 2022 Build Tools at
-`C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools`. The script
-builds `dlss5-feed-host64.cpp` into `native/nvngx.dll`, linking
-`native/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib`. NGX headers are in
-`native/include/`.
+Needs g++ or clang++, the Vulkan headers and PipeWire's:
 
-The artifact `native/nvngx.dll` is not committed to the repo.
+| Distribution | Packages |
+|---|---|
+| Debian / Ubuntu | `build-essential libvulkan-dev libpipewire-0.3-dev` |
+| Fedora | `gcc-c++ vulkan-loader-devel pipewire-devel` |
+| Arch | `base-devel vulkan-headers libpipewire` |
+
+NGX is **not** a build dependency, which is deliberate and is also what
+makes the worker buildable by anyone. The headers travel with the source
+(`native/include/`), and the runtime is resolved at load time with `dlsym`
+against `libnvsdk_ngx.so` or the driver's `libnvidia-ngx.so.1` —
+`NS_NGX_LIB` overrides the search. The Windows build did the same thing for
+a better reason than necessity: it is what makes the runtime swappable, so
+a different NR build can be dropped in and pointed at with `NS_NR_DLL`
+without rebuilding anything.
+
+`native/linux/neuralscreen-host` is a build artefact and is not committed.
+`neuralscreen.sh` builds it on first run.
+
+```
+native/linux/neuralscreen-host --probe
+```
+
+prints the device, whether dmabuf import is available, and whether NGX
+created feature 18 — which is the fastest way to tell a driver problem from
+a program problem.
