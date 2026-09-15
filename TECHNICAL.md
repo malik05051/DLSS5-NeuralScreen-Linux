@@ -534,16 +534,37 @@ here, not an observed one. So the first thing such a shim should do is log,
 once, whether it was called — a run with no such line is a run where NGX
 asked some other way, and that is the fact the whole question turns on.
 
-**None of this is implemented.** No shim is built, wired into
-`build-host.sh`, or put in the worker's environment. The state today is
-**Blackwell only** and stays that way until somebody with a pre-Blackwell
-card writes it and reads that log line. The menu's GPU dot tells the truth
-throughout — it goes green when the worker actually created feature 18, not
-when the architecture merely looks right.
+**This is now implemented, and it is untested on hardware.** The shim is
+`native/linux/ns_archspoof.c`, `build-host.sh` builds it into
+`libns-archspoof.so` beside the worker, and `pipeline._add_arch_spoof` puts
+it in the worker's `LD_PRELOAD` — and in nothing else's. It loads only when
+`gpuinfo.probe()` reports a compute capability the bundled runtime actually
+carries kernels for (7.5, 8.0, 8.6, 8.7, 8.9); a Pascal card gets the honest
+refusal instead of a version check it would pass and then fail behind.
+`NS_ARCH_SPOOF=0` turns it off without rebuilding.
 
-This is the single biggest thing the port has not carried over. Unlike the
-other two gaps it is not blocked on the ecosystem: it is a policy check with
-a published error message, and a standard interposition against it.
+What "untested" means precisely. The shim compiles, exports the three
+symbols it must, and the decision logic has been exercised. Nobody has run
+it against NVIDIA's runtime on a pre-Blackwell card, because the machine it
+was written on has no NVIDIA GPU. So whether it *works* is exactly the open
+question above — whether NGX asks through NVML — and the log answers it on
+the first run:
+
+| What the log says | What it means |
+|---|---|
+| `[spoof] … loading libns-archspoof.so` | the program decided your card qualifies |
+| `[spoof] asked for the architecture: Ampere (7)` | **NGX asked through NVML.** This avenue is live |
+| `[spoof] Ampere -> Blackwell` | the answer was rewritten; watch whether feature 18 now comes up |
+| no `[spoof] asked` line at all | NGX asked some other way. The shim is loaded and irrelevant, and this approach is dead as written |
+
+That last row is a real outcome and not a bug to be worked around blindly.
+If it happens, the next step is to find what the runtime *does* consult, not
+to widen what this file rewrites.
+
+The menu's GPU dot stays the honest signal throughout — it goes green when
+the worker actually created feature 18, not when the architecture merely
+looks right. So the dot, not the absence of an error, is what says whether
+any of this worked.
 
 ### PipeWire output — the switch exists, the worker does not implement it
 

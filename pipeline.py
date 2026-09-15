@@ -105,6 +105,55 @@ def _drain_stderr(worker, logs: list[str], stop: threading.Event) -> None:
         pass
 
 
+# The compute capabilities the bundled runtime carries kernels for, below
+# Blackwell: Turing 7.5, Ampere 8.0/8.6/8.7, Ada 8.9. A card outside this
+# set gains nothing from the shim - it would pass the version check and then
+# fail for want of kernels, which is a worse failure than the honest one.
+SPOOFABLE_CC = {(7, 5), (8, 0), (8, 6), (8, 7), (8, 9)}
+
+# Beside the worker, which is where build-host.sh puts it.
+ARCH_SPOOF_LIB = WORKER_EXE.parent / "libns-archspoof.so"
+
+
+def _add_arch_spoof(env: dict) -> None:
+    """Put the architecture shim in the worker's LD_PRELOAD, if it is wanted.
+
+    NGX refuses feature 18 below Blackwell. That is a version check and not
+    missing kernels, so on a card the runtime can actually serve the shim
+    answers the version question differently and the feature comes up. See
+    native/linux/ns_archspoof.c for what it does and does not rewrite.
+
+    Nothing here is silent: the decision is logged either way, and the shim
+    itself reports whether NGX ever asked it anything. NS_ARCH_SPOOF=0 in the
+    environment turns it off without rebuilding.
+    """
+    if env.get("NS_ARCH_SPOOF", "") == "0":
+        print("[spoof] disabled by NS_ARCH_SPOOF=0")
+        return
+    if not ARCH_SPOOF_LIB.is_file():
+        # Not an error: a Blackwell user never needs it, and a source tree
+        # built before the shim existed has no copy.
+        return
+    try:
+        import gpuinfo
+        info = gpuinfo.probe()
+    except Exception:
+        return
+    capability = info.get("capability", (0, 0))
+    if info.get("official"):
+        return                      # Blackwell or newer: nothing to answer for
+    if capability not in SPOOFABLE_CC:
+        if capability != (0, 0):
+            print(f"[spoof] sm_{capability[0]}{capability[1]} has no kernels "
+                  "in this runtime - not loading the shim")
+        return
+    print(f"[spoof] {info.get('arch') or 'pre-Blackwell'} card "
+          f"(sm_{capability[0]}{capability[1]}): loading {ARCH_SPOOF_LIB.name}")
+    preload = env.get("LD_PRELOAD", "")
+    env["LD_PRELOAD"] = (f"{ARCH_SPOOF_LIB}:{preload}" if preload
+                         else str(ARCH_SPOOF_LIB))
+
+
 def start_worker(params: dict, width: int, height: int, warmup: int,
                  full_w: int = 0, full_h: int = 0,
                  shm: "SharedFrameBuffer | None" = None) -> tuple[subprocess.Popen, list[str]]:
@@ -131,6 +180,7 @@ def start_worker(params: dict, width: int, height: int, warmup: int,
     # of the environment - both set by the caller in st.worker_env.
     pass_fds: tuple = ()
     env = dict(os.environ)
+    _add_arch_spoof(env)
     capture_fd = int(env.pop("NS_PW_FD_SOURCE", "-1") or -1)
     if capture_fd >= 0:
         # dup it to 3 in the child rather than passing whatever number it
