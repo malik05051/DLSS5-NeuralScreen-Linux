@@ -58,8 +58,16 @@ X-GNOME-UsesNotifications=false
 
 
 def launcher_path() -> Path:
-    """The script the desktop entry runs."""
-    return BASE_DIR / "neuralscreen.sh"
+    """The script the desktop entry runs.
+
+    NEURALSCREEN_LAUNCHER overrides it, which is what a distribution package
+    sets. There the program lives under a read-only /usr/share and the thing
+    a user runs is /usr/bin/neuralscreen; without the override an autostart
+    entry written from the menu would point into the package's own directory
+    and miss the wrapper that locates NVIDIA's runtime.
+    """
+    override = os.environ.get("NEURALSCREEN_LAUNCHER", "")
+    return Path(override) if override else BASE_DIR / "neuralscreen.sh"
 
 
 def install_desktop_entry(autostart: bool = False) -> Path | None:

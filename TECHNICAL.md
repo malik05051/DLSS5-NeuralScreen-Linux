@@ -501,24 +501,49 @@ NVIDIA's own code still served every GPU handle and only the returned
 architecture was rewritten. It was confirmed working on a 40-series card by
 a user who ran it.
 
-None of that transfers. The hook depended on nvapi being a Windows DLL with
-one dispatch export, on a call site in a module we could identify, and — in
-the forwarder that went with it — on the Windows loader's rule that a call
-returns to a named module. The Linux runtime asks the driver a different
-way, through a library whose internals nobody here has inspected, and
-inventing an interposition against an API this port has not read would be
-guessing in a place where guessing wrong looks like a crash in NVIDIA's
-code.
+The *mechanism* does not transfer — the hook depended on nvapi being a
+Windows DLL with one dispatch export, and on the Windows loader's rule that
+a call returns to a named module. But the *idea* has an exact Linux
+counterpart, and an earlier draft of this page was wrong to say it did not.
 
-So the honest state is: **Blackwell only.** The menu's GPU dot still tells
-the truth — it goes green when the worker actually created feature 18, not
-when the architecture merely looks right — and `gpuinfo.py` derives the
-verdict from the compute capability, which is the same information nvapi's
-architecture id carried.
+The counterpart is `LD_PRELOAD`. On Linux the natural way to ask a card what
+it is is NVML's `nvmlDeviceGetArchitecture`, which returns a small enum
+(Turing 6, Ampere 7, Ada 8, Blackwell 10) — it is what `gpuinfo.py` uses and
+what the function exists for. Interposing it needs no patching at all: the
+loader resolves the symbol to us first, we call the real one, and we change
+one number. It would also have to interpose `dlsym`, because a runtime that
+`dlopen`s libnvidia-ml.so.1 and looks the symbol up on that handle walks
+straight past a preload.
 
-This is the single biggest thing the port lost. It is also the one whose
-absence is easiest to be sure about, because it is a policy check with a
-published error message.
+Two things such a shim has to be careful about, both learned from the
+Windows version:
+
+* **Rewrite the architecture and not the compute capability.** Kernel
+  selection reads the latter. An Ampere card told it is sm_120 would be
+  handed kernels it cannot execute — a crash inside NVIDIA's code instead of
+  a clean refusal. The Windows hook rewrote the architecture only, for
+  exactly this reason.
+* **Claim Blackwell only for Turing, Ampere and Ada**, the three the runtime
+  has kernels for. A Pascal card would get past the check and then fail with
+  no kernels, which is worse than the honest refusal.
+
+And one thing is genuinely unknown: whether the Linux NGX runtime asks
+through NVML at all. The Windows hook was written against a call this
+project had watched the runtime make; NVML is the most plausible candidate
+here, not an observed one. So the first thing such a shim should do is log,
+once, whether it was called — a run with no such line is a run where NGX
+asked some other way, and that is the fact the whole question turns on.
+
+**None of this is implemented.** No shim is built, wired into
+`build-host.sh`, or put in the worker's environment. The state today is
+**Blackwell only** and stays that way until somebody with a pre-Blackwell
+card writes it and reads that log line. The menu's GPU dot tells the truth
+throughout — it goes green when the worker actually created feature 18, not
+when the architecture merely looks right.
+
+This is the single biggest thing the port has not carried over. Unlike the
+other two gaps it is not blocked on the ecosystem: it is a policy check with
+a published error message, and a standard interposition against it.
 
 ### PipeWire output — the switch exists, the worker does not implement it
 

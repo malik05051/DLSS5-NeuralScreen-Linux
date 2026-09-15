@@ -40,7 +40,7 @@ middle so you can see what the effect is actually doing.*
   | Cards | Status |
   |---|---|
   | **RTX 50** (Blackwell) | ✅ works |
-  | **RTX 40** / **RTX 30** / **RTX 20** | ❌ NGX refuses the feature below Blackwell. The Windows build got past this with a spoof that has no Linux counterpart — see [TECHNICAL.md](TECHNICAL.md), "What did not come across". |
+  | **RTX 40** / **RTX 30** / **RTX 20** | ⚠️ not yet. NGX refuses the feature below Blackwell — a policy check, not missing kernels: the runtime carries sm_75/86/89 and the cards can run them. The Windows build got past it; the Linux equivalent is described but not implemented — see [TECHNICAL.md](TECHNICAL.md), "What did not come across". |
 
 - **The proprietary NVIDIA driver, current.** Not a formality: the neural
   runtime talks to it directly, and an old driver is the commonest reason it
