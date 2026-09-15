@@ -91,7 +91,7 @@ def _set_autostart(enabled: bool) -> bool:
 
     The XDG autostart directory: a .desktop file in ~/.config/autostart is
     read by every desktop environment, which is as close as Linux gets to
-    HKCU\...\Run and is a good deal easier to inspect - it is a text file
+    HKCU\\...\\Run and is a good deal easier to inspect - it is a text file
     the user can open, and deleting it is the whole uninstall.
 
     Written from the program's real location every time it is turned on,

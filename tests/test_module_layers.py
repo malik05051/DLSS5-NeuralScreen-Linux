@@ -29,7 +29,15 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
+# The module globals the runtime provides rather than the source binding.
+# __conditional_annotations__ is injected by the compiler on Python 3.14 and
+# up: under PEP 649 annotations are evaluated lazily, and a module with an
+# annotation inside an "if" keeps a set of the ones that actually ran. It is
+# read and never bound in the source, which is exactly the shape of the miss
+# this test looks for, so it has to be named here or every module carrying a
+# conditional annotation reads as broken on a current interpreter.
+BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__",
+                                 "__conditional_annotations__"}
 
 # The dev-only scripts at the root (_probe_*, _measure_*, the release
 # tooling) are not part of the program and are allowed to import main.
