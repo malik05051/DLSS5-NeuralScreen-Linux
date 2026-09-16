@@ -52,5 +52,22 @@ libs+=(-Wl,-rpath,'$ORIGIN')
 echo "building $OUT with $CXX"
 "$CXX" "${flags[@]}" host.cpp ns_vk.cpp ns_pw.cpp -o "$OUT" "${libs[@]}"
 echo "built $here/$OUT"
+
+# libns-archspoof.so: the architecture shim, for cards below Blackwell. It
+# is built here and loaded nowhere unless the program decides the card needs
+# it (pipeline.start_worker), so building it costs a second and commits to
+# nothing. C, not C++: it interposes C symbols and must export them unmangled.
+CC="${CC:-gcc}"
+SPOOF="libns-archspoof.so"
+spoof_flags=(-std=c11 -shared -fPIC -Wall -Wextra)
+if [[ "${1:-}" == "--debug" ]]; then
+    spoof_flags+=(-O0 -g)
+else
+    spoof_flags+=(-O2 -DNDEBUG)
+fi
+echo "building $SPOOF with $CC"
+"$CC" "${spoof_flags[@]}" ns_archspoof.c -o "$SPOOF" -ldl
+echo "built $here/$SPOOF"
+
 echo
 echo "check it against your card with:  ./$OUT --probe"

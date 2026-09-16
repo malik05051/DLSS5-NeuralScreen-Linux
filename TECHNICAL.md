@@ -501,24 +501,86 @@ NVIDIA's own code still served every GPU handle and only the returned
 architecture was rewritten. It was confirmed working on a 40-series card by
 a user who ran it.
 
-None of that transfers. The hook depended on nvapi being a Windows DLL with
-one dispatch export, on a call site in a module we could identify, and — in
-the forwarder that went with it — on the Windows loader's rule that a call
-returns to a named module. The Linux runtime asks the driver a different
-way, through a library whose internals nobody here has inspected, and
-inventing an interposition against an API this port has not read would be
-guessing in a place where guessing wrong looks like a crash in NVIDIA's
-code.
+The *mechanism* does not transfer — the hook depended on nvapi being a
+Windows DLL with one dispatch export, and on the Windows loader's rule that
+a call returns to a named module. But the *idea* has an exact Linux
+counterpart, and an earlier draft of this page was wrong to say it did not.
 
-So the honest state is: **Blackwell only.** The menu's GPU dot still tells
-the truth — it goes green when the worker actually created feature 18, not
-when the architecture merely looks right — and `gpuinfo.py` derives the
-verdict from the compute capability, which is the same information nvapi's
-architecture id carried.
+The counterpart is `LD_PRELOAD`. On Linux the natural way to ask a card what
+it is is NVML's `nvmlDeviceGetArchitecture`, which returns a small enum
+(Turing 6, Ampere 7, Ada 8, Blackwell 10) — it is what `gpuinfo.py` uses and
+what the function exists for. Interposing it needs no patching at all: the
+loader resolves the symbol to us first, we call the real one, and we change
+one number. It would also have to interpose `dlsym`, because a runtime that
+`dlopen`s libnvidia-ml.so.1 and looks the symbol up on that handle walks
+straight past a preload.
 
-This is the single biggest thing the port lost. It is also the one whose
-absence is easiest to be sure about, because it is a policy check with a
-published error message.
+Two things such a shim has to be careful about, both learned from the
+Windows version:
+
+* **Rewrite the architecture and not the compute capability.** Kernel
+  selection reads the latter. An Ampere card told it is sm_120 would be
+  handed kernels it cannot execute — a crash inside NVIDIA's code instead of
+  a clean refusal. The Windows hook rewrote the architecture only, for
+  exactly this reason.
+* **Claim Blackwell only for Turing, Ampere and Ada**, the three the runtime
+  has kernels for. A Pascal card would get past the check and then fail with
+  no kernels, which is worse than the honest refusal.
+
+And one thing is genuinely unknown: whether the Linux NGX runtime asks
+through NVML at all. The Windows hook was written against a call this
+project had watched the runtime make; NVML is the most plausible candidate
+here, not an observed one. So the first thing such a shim should do is log,
+once, whether it was called — a run with no such line is a run where NGX
+asked some other way, and that is the fact the whole question turns on.
+
+**This is now implemented, and the NVML half is confirmed on hardware.**
+The shim is `native/linux/ns_archspoof.c`, `build-host.sh` builds it into
+`libns-archspoof.so` beside the worker, and `pipeline._add_arch_spoof` puts
+it in the worker's `LD_PRELOAD` — and in nothing else's. It loads only when
+`gpuinfo.probe()` reports a compute capability the bundled runtime actually
+carries kernels for (7.5, 8.0, 8.6, 8.7, 8.9); a Pascal card gets the honest
+refusal instead of a version check it would pass and then fail behind.
+`NS_ARCH_SPOOF=0` turns it off without rebuilding.
+
+What has been observed, on an RTX 3050 Laptop GPU with driver 615.71.09
+(`LD_PRELOAD=./libns-archspoof.so ./neuralscreen-host --probe`):
+
+```
+[spoof] nvmlDeviceGetArchitecture was looked up by handle - interposing
+[spoof] asked for the architecture: Ampere (7)
+[spoof] Ampere -> Blackwell (NS_ARCH_SPOOF=0 to disable)
+ngx: ready (0x00000001 Success)
+```
+
+So the open question is closed: `libnvidia-ngx.so.1` does ask through NVML
+(its imports are `nvmlInitWithFlags`, `nvmlDeviceGetHandleByIndex_v2`,
+`nvmlDeviceGetArchitecture`, and it resolves them on a `dlopen` handle,
+which is why the `dlsym` interposition is not optional), it accepts the
+rewritten answer, and NGX core initialises on an Ampere card. What has
+*not* been observed is feature 18 coming up behind it: on that machine the
+core carries no snippet for any feature (`FAIL_UnableToInitializeFeature`
+for ids 0–18, every `*.Available` capability 0), and NVIDIA's OTA server
+publishes neither Linux snippets nor a `dlssnr` family — see the notes on
+the `--probe` output. The architecture check the snippet itself performs,
+the one the Windows build actually patched around, is still waiting for a
+snippet to perform it. The log reads as follows on any card:
+
+| What the log says | What it means |
+|---|---|
+| `[spoof] … loading libns-archspoof.so` | the program decided your card qualifies |
+| `[spoof] asked for the architecture: Ampere (7)` | **NGX asked through NVML.** This avenue is live |
+| `[spoof] Ampere -> Blackwell` | the answer was rewritten; watch whether feature 18 now comes up |
+| no `[spoof] asked` line at all | NGX asked some other way. The shim is loaded and irrelevant, and this approach is dead as written |
+
+That last row is a real outcome and not a bug to be worked around blindly.
+If it happens, the next step is to find what the runtime *does* consult, not
+to widen what this file rewrites.
+
+The menu's GPU dot stays the honest signal throughout — it goes green when
+the worker actually created feature 18, not when the architecture merely
+looks right. So the dot, not the absence of an error, is what says whether
+any of this worked.
 
 ### PipeWire output — the switch exists, the worker does not implement it
 

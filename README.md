@@ -40,7 +40,7 @@ middle so you can see what the effect is actually doing.*
   | Cards | Status |
   |---|---|
   | **RTX 50** (Blackwell) | ✅ works |
-  | **RTX 40** / **RTX 30** / **RTX 20** | ❌ NGX refuses the feature below Blackwell. The Windows build got past this with a spoof that has no Linux counterpart — see [TECHNICAL.md](TECHNICAL.md), "What did not come across". |
+  | **RTX 40** / **RTX 30** / **RTX 20** | ⚠️ worth trying, unproven. NGX refuses the feature below Blackwell — a policy check, not missing kernels: the runtime carries sm_75/86/89 and the cards can run them. The program loads a shim that answers that check differently, automatically, on a card the runtime has kernels for. The NVML half is confirmed on an RTX 3050: NGX core takes the rewritten answer and initialises. Whether the snippet then accepts the card is still unproven, because no Linux snippet exists to ask — the log says within a second where it stopped. See [TECHNICAL.md](TECHNICAL.md), "The architecture spoof". |
 
 - **The proprietary NVIDIA driver, current.** Not a formality: the neural
   runtime talks to it directly, and an old driver is the commonest reason it
@@ -180,7 +180,7 @@ compatibility** switch is not implemented in this build, and
 
 ## Known limitations
 
-- **Pre-Blackwell cards do not work.** See "What you need" above.
+- **Pre-Blackwell cards are half-proven.** The core accepts the shim on an RTX 3050; the snippet is untested because there is none. See "What you need" above.
 - **GNOME** gets a downgraded overlay — Mutter implements no layer-shell.
 - **Window-follow needs Hyprland or sway.** No other compositor tells a
   client where another client's window is, and none should.

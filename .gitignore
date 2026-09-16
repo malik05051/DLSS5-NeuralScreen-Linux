@@ -8,6 +8,7 @@ __pycache__/
 # Build artefacts (native/linux/build-host.sh)
 *.o
 native/linux/neuralscreen-host
+native/linux/libns-archspoof.so
 native/linux/NeuralScreen-host.log
 
 # The generated layer-shell bindings, when they are cached in-tree rather
