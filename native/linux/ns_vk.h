@@ -157,6 +157,13 @@ public:
     void release_feature(Device &device);
     bool has_feature() const { return feature_ != nullptr; }
 
+    // Diagnostics for --probe. probe_feature asks NGX to create an arbitrary
+    // feature id with a generic parameter set and returns the raw result;
+    // capability reads one integer out of NGX's capability map.
+    uint32_t probe_feature(Device &device, uint32_t feature_id,
+                           uint32_t width, uint32_t height);
+    bool capability(const char *name, int *value);
+
     // One evaluation. `color` and `output` are the same size; `motion` is at
     // the work resolution.
     bool evaluate(Device &device, VkCommandBuffer cmd, Image &color,
