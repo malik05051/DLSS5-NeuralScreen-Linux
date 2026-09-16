@@ -905,15 +905,42 @@ int probe(Host &host)
     printf("dmabuf import: %s\n", host.device.has_dmabuf() ? "yes" : "no");
     printf("ngx: %s (0x%08X %s)\n", host.ngx.ready() ? "ready" : "unavailable",
            host.ngx.last_result(), ngx_result_name(host.ngx.last_result()));
-    if (host.ngx.ready()) {
-        const bool created = host.ngx.create_feature(host.device, 1280, 720,
-                                                     0, 0);
-        printf("feature 18: %s (0x%08X %s)\n", created ? "created" : "refused",
-               host.ngx.last_result(), ngx_result_name(host.ngx.last_result()));
-        host.ngx.release_feature(host.device);
-        return created ? 0 : 2;
+    if (!host.ngx.ready()) return 2;
+
+    // What NGX itself says it has snippets for.
+    static const char *const kCaps[] = {
+        "SuperSampling.Available", "SuperSampling.NeedsUpdatedDriver",
+        "SuperSampling.FeatureInitResult",
+        "SuperSamplingDenoising.Available",
+        "SuperSamplingDenoising.FeatureInitResult",
+        "FrameGeneration.Available", "FrameGeneration.FeatureInitResult",
+        "ImageSuperResolution.Available", "VideoSuperResolution.Available",
+        "DeepDVC.Available", "DeepResolve.Available",
+        "ImageSignalProcessing.Available", "InPainting.Available",
+        "SlowMotion.Available",
+    };
+    for (const char *name : kCaps) {
+        int value = 0;
+        if (host.ngx.capability(name, &value))
+            printf("cap %-44s = %d\n", name, value);
+        else
+            printf("cap %-44s   (not reported)\n", name);
     }
-    return 2;
+
+    // Then ask for every feature id directly. This is the real test: the
+    // capability map only knows the names the SDK headers know.
+    bool nr = false;
+    for (uint32_t id = 0; id < 32; ++id) {
+        const uint32_t r = host.ngx.probe_feature(host.device, id, 1280, 720);
+        const char *verdict = r == 0 ? "CREATED" :
+            (r == 0xBAD0000B || r == 0xBAD00001) ? "no snippet" : "present?";
+        printf("feature %2u: 0x%08X %-32s %s\n", id, r, ngx_result_name(r),
+               verdict);
+        if (id == 18 && r == 0) nr = true;
+    }
+    printf("\nverdict: feature 18 (neural renderer) %s\n",
+           nr ? "available" : "not available on this driver");
+    return nr ? 0 : 2;
 }
 
 }  // namespace

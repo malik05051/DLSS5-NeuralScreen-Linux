@@ -50,8 +50,10 @@ struct NgxApi {
                              VkPhysicalDevice, VkDevice,
                              NVSDK_NGX_Version) = nullptr;
     NVSDK_NGX_Result (*Shutdown1)(VkDevice) = nullptr;
+    NVSDK_NGX_Result (*Shutdown)() = nullptr;
     NVSDK_NGX_Result (*AllocateParameters)(NVSDK_NGX_Parameter **) = nullptr;
     NVSDK_NGX_Result (*DestroyParameters)(NVSDK_NGX_Parameter *) = nullptr;
+    NVSDK_NGX_Result (*GetCapabilityParameters)(NVSDK_NGX_Parameter **) = nullptr;
     NVSDK_NGX_Result (*CreateFeature)(VkCommandBuffer, NVSDK_NGX_Feature,
                                       const NVSDK_NGX_Parameter *,
                                       NVSDK_NGX_Handle **) = nullptr;
@@ -103,10 +105,13 @@ bool load_ngx(std::string *error)
         g_ngx.library = name;
         bind(g_ngx.Init, handle, "NVSDK_NGX_VULKAN_Init");
         bind(g_ngx.Shutdown1, handle, "NVSDK_NGX_VULKAN_Shutdown1");
+        bind(g_ngx.Shutdown, handle, "NVSDK_NGX_VULKAN_Shutdown");
         bind(g_ngx.AllocateParameters, handle,
              "NVSDK_NGX_VULKAN_AllocateParameters");
         bind(g_ngx.DestroyParameters, handle,
              "NVSDK_NGX_VULKAN_DestroyParameters");
+        bind(g_ngx.GetCapabilityParameters, handle,
+             "NVSDK_NGX_VULKAN_GetCapabilityParameters");
         bind(g_ngx.CreateFeature, handle, "NVSDK_NGX_VULKAN_CreateFeature");
         bind(g_ngx.ReleaseFeature, handle, "NVSDK_NGX_VULKAN_ReleaseFeature");
         bind(g_ngx.EvaluateFeature, handle,
@@ -726,7 +731,7 @@ void Ngx::shutdown(Device &device)
         // compiled out of the current SDK headers, and the device-scoped one
         // is what it became. Passing the device is also the honest call -
         // NGX's state belongs to it.
-        g_ngx.Shutdown1(device.handle());
+        if (g_ngx.Shutdown) g_ngx.Shutdown(); else g_ngx.Shutdown1(device.handle());
         initialised_ = false;
     }
 }
@@ -780,6 +785,55 @@ bool Ngx::create_feature(Device &device, uint32_t work_w, uint32_t work_h,
     log("[ngx] feature 18 created: work %ux%u, io %ux%u, upscaling %s",
         work_w, work_h, io_w, io_h, upscale ? "on" : "off");
     return true;
+}
+
+uint32_t Ngx::probe_feature(Device &device, uint32_t feature_id,
+                            uint32_t width, uint32_t height)
+{
+    if (params_ == nullptr) return 0xBAD00000;
+    release_feature(device);
+
+    // A parameter set every feature we know of accepts as a starting point.
+    // We are not after a usable feature here, only NGX's verdict: a missing
+    // snippet answers before it ever reads the parameters, and a present
+    // one complains about *them* rather than about itself.
+    params_->Reset();
+    params_->Set("CreationNodeMask", 1u);
+    params_->Set("VisibilityNodeMask", 1u);
+    params_->Set("Width", width);
+    params_->Set("Height", height);
+    params_->Set("OutWidth", width);
+    params_->Set("OutHeight", height);
+    params_->Set("PerfQualityValue", 0u);
+    params_->Set("DLSS.Feature.Create.Flags", 0u);
+    params_->Set("DLSSNR.Width", width);
+    params_->Set("DLSSNR.Height", height);
+    params_->Set("DLSSNR.InputWidth", width);
+    params_->Set("DLSSNR.InputHeight", height);
+    params_->Set("DLSSNR.OutputWidth", width);
+    params_->Set("DLSSNR.OutputHeight", height);
+
+    VkCommandBuffer cmd = device.begin();
+    if (cmd == VK_NULL_HANDLE) return 0xBAD00000;
+    NVSDK_NGX_Handle *handle = nullptr;
+    NVSDK_NGX_Result r = g_ngx.CreateFeature(
+        cmd, static_cast<NVSDK_NGX_Feature>(feature_id), params_, &handle);
+    device.submit_and_wait(cmd);
+    if (!NVSDK_NGX_FAILED(r) && handle != nullptr) {
+        vkDeviceWaitIdle(device.handle());
+        g_ngx.ReleaseFeature(handle);
+    }
+    return static_cast<uint32_t>(r);
+}
+
+bool Ngx::capability(const char *name, int *value)
+{
+    if (g_ngx.GetCapabilityParameters == nullptr) return false;
+    NVSDK_NGX_Parameter *caps = nullptr;
+    NVSDK_NGX_Result r = g_ngx.GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_FAILED(r) || caps == nullptr) return false;
+    // Capability maps are owned by NGX and must not be destroyed by us.
+    return !NVSDK_NGX_FAILED(caps->Get(name, value));
 }
 
 void Ngx::release_feature(Device &device)
