@@ -534,8 +534,8 @@ here, not an observed one. So the first thing such a shim should do is log,
 once, whether it was called — a run with no such line is a run where NGX
 asked some other way, and that is the fact the whole question turns on.
 
-**This is now implemented, and it is untested on hardware.** The shim is
-`native/linux/ns_archspoof.c`, `build-host.sh` builds it into
+**This is now implemented, and the NVML half is confirmed on hardware.**
+The shim is `native/linux/ns_archspoof.c`, `build-host.sh` builds it into
 `libns-archspoof.so` beside the worker, and `pipeline._add_arch_spoof` puts
 it in the worker's `LD_PRELOAD` — and in nothing else's. It loads only when
 `gpuinfo.probe()` reports a compute capability the bundled runtime actually
@@ -543,12 +543,28 @@ carries kernels for (7.5, 8.0, 8.6, 8.7, 8.9); a Pascal card gets the honest
 refusal instead of a version check it would pass and then fail behind.
 `NS_ARCH_SPOOF=0` turns it off without rebuilding.
 
-What "untested" means precisely. The shim compiles, exports the three
-symbols it must, and the decision logic has been exercised. Nobody has run
-it against NVIDIA's runtime on a pre-Blackwell card, because the machine it
-was written on has no NVIDIA GPU. So whether it *works* is exactly the open
-question above — whether NGX asks through NVML — and the log answers it on
-the first run:
+What has been observed, on an RTX 3050 Laptop GPU with driver 615.71.09
+(`LD_PRELOAD=./libns-archspoof.so ./neuralscreen-host --probe`):
+
+```
+[spoof] nvmlDeviceGetArchitecture was looked up by handle - interposing
+[spoof] asked for the architecture: Ampere (7)
+[spoof] Ampere -> Blackwell (NS_ARCH_SPOOF=0 to disable)
+ngx: ready (0x00000001 Success)
+```
+
+So the open question is closed: `libnvidia-ngx.so.1` does ask through NVML
+(its imports are `nvmlInitWithFlags`, `nvmlDeviceGetHandleByIndex_v2`,
+`nvmlDeviceGetArchitecture`, and it resolves them on a `dlopen` handle,
+which is why the `dlsym` interposition is not optional), it accepts the
+rewritten answer, and NGX core initialises on an Ampere card. What has
+*not* been observed is feature 18 coming up behind it: on that machine the
+core carries no snippet for any feature (`FAIL_UnableToInitializeFeature`
+for ids 0–18, every `*.Available` capability 0), and NVIDIA's OTA server
+publishes neither Linux snippets nor a `dlssnr` family — see the notes on
+the `--probe` output. The architecture check the snippet itself performs,
+the one the Windows build actually patched around, is still waiting for a
+snippet to perform it. The log reads as follows on any card:
 
 | What the log says | What it means |
 |---|---|
