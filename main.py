@@ -310,6 +310,18 @@ def main() -> int:
     # The pipeline's mutable state (see _Pipeline): one object
     # instead of 56 closure variables.
     st = _Pipeline()
+    # kill(1) sends SIGTERM; the default action is an abrupt exit that leaves
+    # the overlay and the Proton child behind. Turn both SIGTERM and SIGINT
+    # into KeyboardInterrupt so the one shutdown path runs - and so the app is
+    # always killable without -9, even while the menu holds the keyboard.
+    import signal as _signal
+    def _sig(_n, _f):
+        raise KeyboardInterrupt
+    for _s in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _signal.signal(_s, _sig)
+        except (ValueError, OSError):
+            pass
     parser = argparse.ArgumentParser(description="DLSS 5 Desktop NR prototype")
     parser.add_argument("--config", type=Path, default=paths.config_path(),
                         help="path to config.json (next to main.py when there "
@@ -556,6 +568,14 @@ def main() -> int:
                 else:
                     frame = np.ascontiguousarray(frame, dtype=np.uint8)
                 st.work_frame = frame
+                if st.frame_index < 5:
+                    try:
+                        import numpy as _np
+                        print(f"[capture] frame {st.frame_index}: "
+                              f"{frame.shape} mean={float(_np.asarray(frame)[..., :3].mean()):.1f}",
+                              file=sys.stderr)
+                    except Exception:
+                        pass
 
             # --- Sending the frame with auto-recovery ---
             # The worker can die or hang (NGX after RNSZ, a GPU conflict) -
@@ -896,8 +916,9 @@ def main() -> int:
                     st.display.menu.set_state(settings_io.menu_payload(st))
                     st.display.menu.visible = True
                     st.display.set_menu_opaque(True)
-                    st.display.set_menu_input(True)
-                    print("[main] menu opened at startup")
+                    st.display.set_menu_input(True, keyboard=False)
+                    print("[main] menu opened at startup (keyboard left with "
+                          "the session; Ctrl+C in the terminal quits)")
                 else:
                     st.display.alert(UI_STRINGS[st.lang]["started"], 3.5)
             st.work_frame = next_frame  # None -> grab at the start of the next iteration
