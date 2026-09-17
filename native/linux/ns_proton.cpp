@@ -77,7 +77,7 @@ ProtonNr::~ProtonNr() { stop(); }
 
 bool ProtonNr::locate(const std::string &exe_dir, std::string *exe,
                       std::string *wine, std::string *prefix,
-                      std::string *describe)
+                      std::string *describe, std::string *runtime_dll)
 {
     std::string e;
     if (const char *v = getenv("NS_NR_EXE")) e = v;
@@ -96,8 +96,10 @@ bool ProtonNr::locate(const std::string &exe_dir, std::string *exe,
     if (const char *v = getenv("NS_PROTON_PREFIX")) p = v;
     else p = home_dir() + "/.local/share/neuralscreen/pfx";
 
+    // The runtime: NS_NR_DLL for a swapped-in build, else beside the exe.
     std::string dll;
-    if (!e.empty()) {
+    if (const char *v = getenv("NS_NR_DLL")) dll = v;
+    else if (!e.empty()) {
         const size_t slash = e.rfind('/');
         dll = (slash == std::string::npos ? std::string(".") : e.substr(0, slash))
               + "/nvngx_dlssnr.dll";
@@ -111,14 +113,15 @@ bool ProtonNr::locate(const std::string &exe_dir, std::string *exe,
     if (exe) *exe = e;
     if (wine) *wine = w;
     if (prefix) *prefix = p;
+    if (runtime_dll) *runtime_dll = dll;
     return !e.empty() && is_file(dll) && !w.empty() && is_dir(p + "/drive_c");
 }
 
 bool ProtonNr::start(const std::string &exe_dir, std::string *error)
 {
     if (running()) return true;
-    std::string exe, wine, prefix, describe;
-    if (!locate(exe_dir, &exe, &wine, &prefix, &describe)) {
+    std::string exe, wine, prefix, describe, dll;
+    if (!locate(exe_dir, &exe, &wine, &prefix, &describe, &dll)) {
         if (error) *error = "Proton neural renderer is not set up (" + describe + ")";
         return false;
     }
@@ -171,7 +174,8 @@ bool ProtonNr::start(const std::string &exe_dir, std::string *error)
         setenv("VKD3D_DEBUG", "err", 0);
         // The NVML shim is for the native NGX core; Wine must not inherit it.
         unsetenv("LD_PRELOAD");
-        execl(wine.c_str(), wine.c_str(), exe.c_str(), shm_path_.c_str(), static_cast<char *>(nullptr));
+        execl(wine.c_str(), wine.c_str(), exe.c_str(), shm_path_.c_str(), dll.c_str(),
+              static_cast<char *>(nullptr));
         _exit(127);
     }
     close(in[0]); close(out[1]);

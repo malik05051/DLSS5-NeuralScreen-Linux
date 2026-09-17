@@ -70,9 +70,10 @@ def _init_logging() -> None:
 def _apply_nr_dll(cfg: dict) -> None:
     """The swappable runtime: a configured nr_dll reaches the worker.
 
-    The worker loads nvngx_dlssnr.so by name; NS_NR_DLL lets a different
-    build be loaded without rebuilding the worker (the RHI
-    dlss_manifest.json pattern). The path is put into the environment,
+    The Proton side loads nvngx_dlssnr.dll from beside its exe; NS_NR_DLL
+    lets a different build be loaded without rebuilding anything (the RHI
+    dlss_manifest.json pattern) - the worker hands the directory to the
+    Proton process as NS_NR_EXE's neighbour. The path is put into the environment,
     which subprocess inherits. Without the flag the bundled runtime stays
     the default.
     """

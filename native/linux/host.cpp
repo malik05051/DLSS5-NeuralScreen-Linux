@@ -899,6 +899,14 @@ int run(Host &host)
 
             bool have_colour = false;
             if (frame.flags & FRAME_FLAG_NO_COLOR) {
+                // The worker captures the colour itself, but the motion
+                // field still comes from Python - inline, right behind the
+                // header (protocol.send_frame's no_color path), whatever
+                // the shared section was agreed for. Not reading it left
+                // the next "magic" being four bytes of motion data.
+                std::vector<uint8_t> motion_inline(motion_bytes);
+                if (!read_exact(motion_inline.data(), motion_inline.size())) return 1;
+                host.upload_motion(motion_inline.data(), motion_bytes);
                 have_colour = host.take_capture_frame();
                 if (!have_colour) {
                     // No new frame from the compositor: the screen has not

@@ -170,8 +170,8 @@ def start_worker(params: dict, width: int, height: int, warmup: int,
     if not WORKER_EXE.is_file():
         raise FileNotFoundError(
             f"worker not found: {WORKER_EXE}\n"
-            "Build it with native/linux/build-host.sh, and put "
-            "nvngx_dlssnr.so in native/."
+            "Build it with native/linux/build-host.sh, and set up the "
+            "Proton side with native/proton/setup.sh."
         )
     # The PipeWire remote is a file descriptor, and a file descriptor cannot
     # travel down a pipe as a number. It is handed over the only way one

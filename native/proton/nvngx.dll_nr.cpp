@@ -7,7 +7,9 @@
 // nothing about capture, the overlay or Python - see ns_nr_wire.h for the
 // whole of what it knows.
 //
-//   nvngx.dll_nr.exe <unix path of the mapping>
+//   nvngx.dll_nr.exe <unix path of the mapping> [unix path of nvngx_dlssnr.dll]
+//
+// Without the second argument the runtime is loaded from beside this exe.
 //
 // The file name carries "nvngx.dll" because the runtime refuses calls from
 // a module whose path lacks that substring. NVSDK_NGX_Parameter is an MSVC
@@ -163,6 +165,7 @@ struct Server {
     HANDLE shm_file = INVALID_HANDLE_VALUE, shm_map = nullptr;
     uint64_t shm_size = 0;
     std::wstring shm_path;
+    std::wstring dll_path = L"nvngx_dlssnr.dll";
 
     bool init_gpu();
     bool init_ngx();
@@ -219,8 +222,8 @@ bool Server::init_ngx()
     if (NVSDK_NGX_FAILED(r) || !praw) { LOG("AllocateParameters -> 0x%08X", r); return false; }
     p.o = praw;
 
-    runtime = LoadLibraryW(L"nvngx_dlssnr.dll");
-    if (!runtime) { LOG("nvngx_dlssnr.dll did not load, err=%lu (it must sit beside this exe)", GetLastError()); return false; }
+    runtime = LoadLibraryW(dll_path.c_str());
+    if (!runtime) { LOG("%ls did not load, err=%lu", dll_path.c_str(), GetLastError()); return false; }
     init_ext = reinterpret_cast<PFN_InitExt>(GetProcAddress(runtime, "NVSDK_NGX_D3D12_Init_Ext"));
     create = reinterpret_cast<PFN_Create>(GetProcAddress(runtime, "NVSDK_NGX_D3D12_CreateFeature"));
     eval = reinterpret_cast<PFN_Eval>(GetProcAddress(runtime, "NVSDK_NGX_D3D12_EvaluateFeature"));
@@ -420,6 +423,7 @@ int main(int argc, char **argv)
     _setmode(_fileno(stdout), _O_BINARY);
     Server s;
     s.shm_path = windows_path(argv[1]);
+    if (argc > 2) s.dll_path = windows_path(argv[2]);
     GetModuleFileNameW(nullptr, s.dir, MAX_PATH);
     if (wchar_t *slash = wcsrchr(s.dir, L'\\')) *(slash + 1) = L'\0';
 

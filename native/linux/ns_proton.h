@@ -30,6 +30,7 @@ public:
     // Where the pieces are. Every one can be overridden by environment:
     //   NS_NR_EXE      the Windows-side program (default: ../proton/nvngx.dll_nr.exe
     //                  relative to this binary, then native/proton/)
+    //   NS_NR_DLL      nvngx_dlssnr.dll (default: beside the exe)
     //   NS_PROTON_WINE the wine binary to run it with (default: the newest
     //                  GE-Proton under ~/.local/share/Steam/compatibilitytools.d)
     //   NS_PROTON_PREFIX the WINEPREFIX (default: ~/.local/share/neuralscreen/pfx)
@@ -38,7 +39,7 @@ public:
     // `describe` says what was found, for the log and --probe.
     static bool locate(const std::string &exe_dir, std::string *exe,
                        std::string *wine, std::string *prefix,
-                       std::string *describe);
+                       std::string *describe, std::string *runtime_dll = nullptr);
 
     // Start the child and wait for its hello. False with `error` set when
     // the pieces are missing or the child could not bring up D3D12/NGX.
