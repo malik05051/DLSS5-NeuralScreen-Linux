@@ -450,6 +450,7 @@ class WaylandShell:
         self.seat = None
         self.layer_shell = None
         self.layer_surface_cls = None
+        self.layer_shell_cls = None
         self.xdg_wm_base = None
         self.xdg_output_manager = None
         self.cursor_shape = None
@@ -541,6 +542,7 @@ class WaylandShell:
                 self.layer_shell = registry.bind(name, shell_cls,
                                                  min(version, 4))
                 self.layer_surface_cls = surface_cls
+                self.layer_shell_cls = shell_cls
         except Exception as exc:
             print(f"[wayland] could not bind {interface}: {exc}",
                   file=sys.stderr)
@@ -866,11 +868,14 @@ class Overlay:
     def _make_layer_surface(self) -> None:
         shell = self._shell
         cls = shell.layer_surface_cls
+        # The layer enum belongs to the shell's interface class. pywayland
+        # 0.4.19 stopped forwarding enums through the proxy, which is why
+        # this reads it from the class that was bound, not the binding.
+        layer_enum = shell.layer_shell_cls.layer if shell.layer_shell_cls \
+            else shell.layer_shell.layer
         self._layer_surface = shell.layer_shell.get_layer_surface(
             self.surface, self.output.proxy if self.output else None,
-            cls.layer.overlay.value if hasattr(cls, "layer")
-            else shell.layer_shell.layer.overlay.value,
-            "neuralscreen")
+            layer_enum.overlay.value, "neuralscreen")
         ls = self._layer_surface
         ls.set_size(self.width, self.height)
         # Anchoring to all four edges makes the compositor configure us with

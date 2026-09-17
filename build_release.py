@@ -56,9 +56,12 @@ extra = [
     "README.ru.md",
     # Built by native/linux/build-host.sh, gitignored on purpose.
     "native/linux/neuralscreen-host",
-    # NVIDIA's own runtime: 165 MB, over GitHub's file limit, so it is never
-    # in git and always in the archive.
-    "native/nvngx_dlssnr.so",
+    # The Proton side of the neural renderer: our exe, built by
+    # native/proton/build.sh, and NVIDIA's own runtime beside it - 165 MB,
+    # over GitHub's file limit, so it is never in git and always in the
+    # archive.
+    "native/proton/nvngx.dll_nr.exe",
+    "native/proton/nvngx_dlssnr.dll",
 ]
 
 #: Repository files that are not the program. The tests and the builders are
@@ -81,7 +84,9 @@ DEV_ONLY = {
 RUNTIME_ASSETS = (
     "native/neuralscreen.png",
     "native/linux/neuralscreen-host",
-    "native/nvngx_dlssnr.so",
+    "native/linux/libns-archspoof.so",
+    "native/proton/nvngx.dll_nr.exe",
+    "native/proton/nvngx_dlssnr.dll",
     "native/protocols/wlr-layer-shell-unstable-v1.xml",
 )
 
@@ -170,7 +175,10 @@ def runtime_architectures(path: str) -> set[int]:
     return set(found)
 
 
-snippet_path = Path("native/nvngx_dlssnr.so")
+snippet_path = Path("native/proton/nvngx_dlssnr.dll")
+nr_exe = Path("native/proton/nvngx.dll_nr.exe")
+if not nr_exe.is_file():
+    raise SystemExit(f"{nr_exe} is not built - run native/proton/build.sh")
 if not snippet_path.is_file():
     raise SystemExit(
         f"{snippet_path} is missing - it is NVIDIA's own runtime and is "
@@ -202,7 +210,7 @@ commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(
 version_txt = (
     f"NeuralScreen {VERSION}\n"
     f"commit: {commit}\n"
-    f"runtime: nvngx_dlssnr.so sha256 {snippet_sha}\n"
+    f"runtime: nvngx_dlssnr.dll sha256 {snippet_sha}\n"
     f"kernel archs: "
     f"{', '.join(sorted(SM_NAMES.get(a, f'sm_{a}') for a in archs))}\n"
     f"targets: {TARGET_ARCHS}\n"

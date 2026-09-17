@@ -65,13 +65,20 @@ fi
 [[ -z "$PY" ]] && PY="python3"
 command -v "$PY" >/dev/null 2>&1 || die "python3 not found (looked for '$PY')"
 
-# The NGX snippet: NVIDIA's own runtime, 165 MB, not redistributable through
-# this repository. Without it the program starts and the picture is never
-# processed, which is a worse failure than not starting - so it is checked.
-if [[ ! -f "$here/native/nvngx_dlssnr.so" ]]; then
-    die "native/nvngx_dlssnr.so is missing.
+# The neural renderer runs through Proton (NVIDIA ships it only as a D3D12
+# DLL): our nvngx.dll_nr.exe plus NVIDIA's own nvngx_dlssnr.dll, 165 MB and
+# not redistributable through this repository. Without them the program
+# starts and the picture is never processed, which is a worse failure than
+# not starting - so they are checked. NS_NR_DLL points at a runtime kept
+# elsewhere; native/proton/setup.sh builds the rest and prepares the prefix.
+if [[ ! -f "$here/native/proton/nvngx.dll_nr.exe" ]]; then
+    die "native/proton/nvngx.dll_nr.exe is not built.
+Run native/proton/setup.sh - see README.md, the section 'What you need'."
+fi
+if [[ ! -f "${NS_NR_DLL:-$here/native/proton/nvngx_dlssnr.dll}" ]]; then
+    die "native/proton/nvngx_dlssnr.dll is missing.
 See README.md, the section 'What you need' - it is NVIDIA's neural
-renderer runtime and has to be put there by hand."
+renderer runtime and has to be put there by hand (or NS_NR_DLL set)."
 fi
 
 # The worker: a build artefact, not stored in git. Built once, here.

@@ -40,11 +40,13 @@ middle so you can see what the effect is actually doing.*
   | Cards | Status |
   |---|---|
   | **RTX 50** (Blackwell) | ✅ works |
-  | **RTX 40** / **RTX 30** / **RTX 20** | ⚠️ worth trying, unproven. NGX refuses the feature below Blackwell — a policy check, not missing kernels: the runtime carries sm_75/86/89 and the cards can run them. The program loads a shim that answers that check differently, automatically, on a card the runtime has kernels for. The NVML half is confirmed on an RTX 3050: NGX core takes the rewritten answer and initialises. Whether the snippet then accepts the card is still unproven, because no Linux snippet exists to ask — the log says within a second where it stopped. See [TECHNICAL.md](TECHNICAL.md), "The architecture spoof". |
+  | **RTX 40** / **RTX 30** / **RTX 20** | ✅ works — verified on an RTX 3050. NGX refuses the feature below Blackwell, a policy check its own kernels (sm_75/86/89) contradict; here the answer comes from dxvk-nvapi, and `DXVK_NVAPI_GPU_ARCH=GB200` settles it. See [TECHNICAL.md](TECHNICAL.md). |
 
-- **The proprietary NVIDIA driver, current.** Not a formality: the neural
-  runtime talks to it directly, and an old driver is the commonest reason it
-  refuses to start or the picture never appears. Nouveau will not do.
+- **The proprietary NVIDIA driver, current, and [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom).**
+  NVIDIA ships the neural renderer only as a D3D12 DLL (no Linux build exists — TECHNICAL.md),
+  so the network runs in a small Windows process under Proton; capture, overlay and menu stay native.
+  `./native/proton/setup.sh` builds that side (needs `umu-launcher`, `mingw-w64-gcc`) and ends with
+  a verdict. An old driver is the commonest reason nothing appears; Nouveau will not do.
 - **xdg-desktop-portal** with your desktop's backend, and **PipeWire**. The
   capture, the hotkeys and the file dialogs all come through the portal.
 - **Python 3.10+** and a handful of modules — the launcher names them and
@@ -53,10 +55,9 @@ middle so you can see what the effect is actually doing.*
 ## Install
 
 1. Download the archive from [Releases](https://github.com/perseval-BLR/DLSS5-NeuralScreen/releases)
-   and unpack it anywhere. NVIDIA's runtime is inside.
-2. Run **`./neuralscreen.sh`**. The first run builds the worker (a few
-   seconds, needs `g++`, `libvulkan-dev` and `libpipewire-0.3-dev`) and
-   writes a launcher entry so the program shows up in your application menu.
+   and unpack it anywhere. NVIDIA's runtime is inside (`native/proton/nvngx_dlssnr.dll`).
+2. Run **`./native/proton/setup.sh`** once, then **`./neuralscreen.sh`**. The first run builds the
+   worker (a few seconds, needs `g++`, `libvulkan-dev`, `libpipewire-0.3-dev`) and writes a launcher entry.
 
 There is no installer: to remove the program, delete the folder and run
 `./neuralscreen.sh --uninstall` first to take the launcher entry and the
@@ -180,7 +181,7 @@ compatibility** switch is not implemented in this build, and
 
 ## Known limitations
 
-- **Pre-Blackwell cards are half-proven.** The core accepts the shim on an RTX 3050; the snippet is untested because there is none. See "What you need" above.
+- **The network runs through Proton** (NVIDIA ships it only for D3D12): an RTX 3050 Laptop GPU gets 24–25 fps with the network at 1248×702 over a 1080p desktop.
 - **GNOME** gets a downgraded overlay — Mutter implements no layer-shell.
 - **Window-follow needs Hyprland or sway.** No other compositor tells a
   client where another client's window is, and none should.
@@ -194,6 +195,6 @@ compatibility** switch is not implemented in this build, and
 
 ## License
 
-The code here is MIT. NVIDIA's `nvngx_dlssnr.so` is the leaked 310.8.0
-runtime (sm_75/86/89/120 kernels), included as-is, no guarantees,
-research-only. Interface faces: IBM Plex (OFL-1.1, `fonts/OFL.txt`).
+The code here is MIT. NVIDIA's `nvngx_dlssnr.dll` is the leaked 310.8.0
+runtime (sm_75/86/89/120 kernels), never in this repository, shipped in the
+release archive as-is, no guarantees, research-only. Interface faces: IBM Plex (OFL-1.1, `fonts/OFL.txt`).

@@ -16,13 +16,17 @@ BASE_DIR = Path(__file__).resolve().parent
 NATIVE_DIR = BASE_DIR / "native"
 
 
-# The NGX snippet. On Linux NGX loads `nvngx_dlssnr.so` out of the
-# application path handed to NVSDK_NGX_VULKAN_Init - there is no registry
-# and no per-process name rule, unlike the Windows build where NGX Core
-# returned FAIL_PlatformError for any host process not called nvngx.dll.
-# The file name is still part of the contract: NGX builds it from the
-# feature id, so it cannot be renamed.
-NR_SNIPPET = NATIVE_DIR / "nvngx_dlssnr.so"
+# The neural renderer. NVIDIA ships DLSSNR only as a D3D12 DLL and there is
+# no Linux snippet for NGX to load, so the network runs in a small Windows
+# program under Proton: native/proton/nvngx.dll_nr.exe, with NVIDIA's
+# nvngx_dlssnr.dll beside it. The worker starts that process itself
+# (native/linux/ns_proton.cpp); these paths are what the launcher and the
+# packager check for. The DLL's name is part of the contract - NGX derives
+# it from the feature id - and the exe's name must contain "nvngx.dll",
+# because the runtime refuses calls from any other module.
+PROTON_DIR = NATIVE_DIR / "proton"
+NR_EXE = PROTON_DIR / "nvngx.dll_nr.exe"
+NR_SNIPPET = PROTON_DIR / "nvngx_dlssnr.dll"
 
 
 # The worker is an ordinary ELF executable here; the Windows build had to

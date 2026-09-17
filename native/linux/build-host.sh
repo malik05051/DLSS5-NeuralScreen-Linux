@@ -50,7 +50,7 @@ libs=($(pkg-config --libs libpipewire-0.3) -lvulkan -lpthread -ldl -lrt)
 libs+=(-Wl,-rpath,'$ORIGIN')
 
 echo "building $OUT with $CXX"
-"$CXX" "${flags[@]}" host.cpp ns_vk.cpp ns_pw.cpp -o "$OUT" "${libs[@]}"
+"$CXX" "${flags[@]}" host.cpp ns_vk.cpp ns_pw.cpp ns_proton.cpp -o "$OUT" "${libs[@]}"
 echo "built $here/$OUT"
 
 # libns-archspoof.so: the architecture shim, for cards below Blackwell. It

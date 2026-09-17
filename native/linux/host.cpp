@@ -49,6 +49,7 @@
 #include <unistd.h>
 
 #include "ns_ipc.h"
+#include "ns_proton.h"
 #include "ns_pw.h"
 #include "ns_vk.h"
 
@@ -216,7 +217,14 @@ private:
 struct Host {
     Device device;
     Ngx ngx;
+    ProtonNr proton;
     PwCapture capture;
+    std::string exe_dir;
+    // Which side runs the network. Native NGX is tried first and would win
+    // the day NVIDIA ships a Linux snippet; until then it is the Proton
+    // process, and the log says so once.
+    bool via_proton = false;
+    bool backend_logged = false;
 
     // Sizes. `work` is what the network runs at, `full` what comes in.
     uint32_t work_w = 0, work_h = 0;
@@ -264,6 +272,8 @@ struct Host {
     bool build_resources();
     void release_resources();
     bool ensure_feature();
+    uint32_t nr_result() const { return via_proton ? proton.last_result() : ngx.last_result(); }
+    void release_nr_feature() { ngx.release_feature(device); proton.release_feature(device); }
 
     bool take_capture_frame();
     bool upload_colour(const uint8_t *pixels, size_t bytes);
@@ -327,8 +337,31 @@ void Host::release_resources()
 
 bool Host::ensure_feature()
 {
-    if (ngx.has_feature()) return true;
-    return ngx.create_feature(device, work_w, work_h, full_w, full_h);
+    if (ngx.has_feature() || proton.has_feature()) return true;
+    if (ngx.ready() && ngx.create_feature(device, work_w, work_h, full_w, full_h)) {
+        via_proton = false;
+        if (!backend_logged) log("[host] the neural pass runs natively through NGX");
+        backend_logged = true;
+        return true;
+    }
+    const uint32_t native_result = ngx.ready() ? ngx.last_result() : 0;
+    std::string error;
+    if (!proton.running() && !proton.start(exe_dir, &error)) {
+        if (!backend_logged) {
+            log("[host] native NGX has no feature 18 (0x%08X) and %s", native_result, error.c_str());
+        }
+        backend_logged = true;
+        via_proton = false;
+        return false;
+    }
+    if (!proton.create_feature(device, work_w, work_h, full_w, full_h)) return false;
+    via_proton = true;
+    if (!backend_logged) {
+        log("[host] the neural pass runs through Proton (native NGX answered 0x%08X for feature 18)",
+            native_result);
+    }
+    backend_logged = true;
+    return true;
 }
 
 // --- pixels in ------------------------------------------------------------
@@ -563,7 +596,7 @@ bool Host::run_frame(const NsFrame &frame, uint32_t *ngx_result)
     // right, and re-running the network on an identical frame is the one
     // cost with no benefit at all.
     if (frame.flags & FRAME_FLAG_SKIP_STATIC) {
-        *ngx_result = ngx.last_result();
+        *ngx_result = nr_result();
         return true;
     }
 
@@ -578,8 +611,14 @@ bool Host::run_frame(const NsFrame &frame, uint32_t *ngx_result)
     }
 
     if (!ensure_feature()) {
-        *ngx_result = ngx.last_result();
+        *ngx_result = nr_result();
         return false;
+    }
+    if (via_proton) {
+        const bool ok = proton.evaluate(device, color, output, motion, options,
+                                        frame.reset != 0);
+        *ngx_result = proton.last_result();
+        return ok;
     }
     VkCommandBuffer cmd = device.begin();
     if (cmd == VK_NULL_HANDLE) return false;
@@ -647,7 +686,7 @@ int run(Host &host)
             host.nr_small = resize
                                 ? (header.frame_count & RESIZE_FLAG_NR_SMALL) != 0
                                 : host.nr_small;
-            host.ngx.release_feature(host.device);
+            host.release_nr_feature();
             host.release_resources();
             const bool built = host.build_resources() && host.ensure_feature();
             if (resize) {
@@ -656,7 +695,7 @@ int run(Host &host)
                 // did nothing was how a resize used to end in a black
                 // screen.
                 send_ack(RESIZE_ACK_MAGIC, built ? 1u : 0u,
-                         host.ngx.last_result(), 0, 0);
+                         host.nr_result(), 0, 0);
             }
             log("[host] %s: work %ux%u, io %ux%u -> %s",
                 resize ? "reconfigured" : "header", host.work_w, host.work_h,
@@ -860,6 +899,14 @@ int run(Host &host)
 
             bool have_colour = false;
             if (frame.flags & FRAME_FLAG_NO_COLOR) {
+                // The worker captures the colour itself, but the motion
+                // field still comes from Python - inline, right behind the
+                // header (protocol.send_frame's no_color path), whatever
+                // the shared section was agreed for. Not reading it left
+                // the next "magic" being four bytes of motion data.
+                std::vector<uint8_t> motion_inline(motion_bytes);
+                if (!read_exact(motion_inline.data(), motion_inline.size())) return 1;
+                host.upload_motion(motion_inline.data(), motion_bytes);
                 have_colour = host.take_capture_frame();
                 if (!have_colour) {
                     // No new frame from the compositor: the screen has not
@@ -899,13 +946,49 @@ int run(Host &host)
     }
 }
 
+// The Proton route: is it set up, and does the DLL create and evaluate
+// feature 18 on this card through it? A real evaluation, timed, because
+// "created" alone is not the answer the user needs.
+bool probe_proton(Host &host)
+{
+    std::string exe, wine, prefix, describe, error;
+    const bool located = ProtonNr::locate(host.exe_dir, &exe, &wine, &prefix, &describe);
+    printf("\nproton: %s\n", describe.c_str());
+    if (!located) {
+        printf("proton verdict: not set up - see native/proton/README.md\n");
+        return false;
+    }
+    if (!host.proton.start(host.exe_dir, &error)) {
+        printf("proton verdict: %s\n", error.c_str());
+        return false;
+    }
+    host.work_w = 1280; host.work_h = 720; host.full_w = 0; host.full_h = 0;
+    if (!host.build_resources()) { printf("proton verdict: could not build test images\n"); return false; }
+    const bool created = host.proton.create_feature(host.device, 1280, 720, 0, 0);
+    printf("proton feature 18: %s (0x%08X %s, %u ms)\n", created ? "created" : "refused",
+           host.proton.last_result(), ngx_result_name(host.proton.last_result()),
+           host.proton.last_millis());
+    if (!created) return false;
+    bool ok = true;
+    for (int i = 0; i < 5 && ok; ++i) {
+        ok = host.proton.evaluate(host.device, host.color, host.output, host.motion, host.options, i == 0);
+        printf("proton evaluate %d: %s (0x%08X, %u ms on the GPU)\n", i, ok ? "ok" : "FAILED",
+               host.proton.last_result(), host.proton.last_millis());
+    }
+    printf("\nproton verdict: feature 18 (neural renderer) %s through Proton at 1280x720\n",
+           ok ? "WORKS" : "does not work");
+    host.proton.release_feature(host.device);
+    host.release_resources();
+    return ok;
+}
+
 int probe(Host &host)
 {
     printf("device: %s\n", host.device.name().c_str());
     printf("dmabuf import: %s\n", host.device.has_dmabuf() ? "yes" : "no");
     printf("ngx: %s (0x%08X %s)\n", host.ngx.ready() ? "ready" : "unavailable",
            host.ngx.last_result(), ngx_result_name(host.ngx.last_result()));
-    if (!host.ngx.ready()) return 2;
+    if (!host.ngx.ready()) return probe_proton(host) ? 0 : 2;
 
     // What NGX itself says it has snippets for.
     static const char *const kCaps[] = {
@@ -938,9 +1021,10 @@ int probe(Host &host)
                verdict);
         if (id == 18 && r == 0) nr = true;
     }
-    printf("\nverdict: feature 18 (neural renderer) %s\n",
+    printf("\nnative verdict: feature 18 (neural renderer) %s\n",
            nr ? "available" : "not available on this driver");
-    return nr ? 0 : 2;
+    if (nr) return 0;
+    return probe_proton(host) ? 0 : 2;
 }
 
 }  // namespace
@@ -971,6 +1055,7 @@ int main(int argc, char **argv)
     // the path is where the snippet is - next to this binary, or wherever
     // NS_NR_DLL points for a swapped-in build.
     std::string snippet_dir = exe_dir(argv[0]);
+    host.exe_dir = snippet_dir;
     if (const char *override_path = getenv("NS_NR_DLL")) {
         const std::string value(override_path);
         const size_t slash = value.rfind('/');
@@ -978,9 +1063,8 @@ int main(int argc, char **argv)
     }
     if (!host.ngx.init(host.device, snippet_dir, &error)) {
         log("[host] %s", error.c_str());
-        log("[host] the neural pass will not run: check that "
-            "nvngx_dlssnr.so is in %s and that the driver is current",
-            snippet_dir.c_str());
+        log("[host] native NGX is unavailable; the neural pass will use "
+            "Proton if native/proton is set up");
     }
     if (env_flag("NS_SPOUT")) {
         // The PipeWire output node: publishing the result so OBS can read
@@ -992,7 +1076,8 @@ int main(int argc, char **argv)
 
     const int rc = want_probe ? probe(host) : run(host);
     host.capture.stop();
-    host.ngx.release_feature(host.device);
+    host.release_nr_feature();
+    host.proton.stop();
     host.release_resources();
     host.ngx.shutdown(host.device);
     host.device.destroy();
