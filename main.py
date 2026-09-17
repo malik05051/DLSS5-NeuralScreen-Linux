@@ -568,11 +568,12 @@ def main() -> int:
                 else:
                     frame = np.ascontiguousarray(frame, dtype=np.uint8)
                 st.work_frame = frame
-                if st.frame_index < 5:
+                if st.frame_index < 15 or st.frame_index % 30 == 0:
                     try:
                         import numpy as _np
-                        print(f"[capture] frame {st.frame_index}: "
-                              f"{frame.shape} mean={float(_np.asarray(frame)[..., :3].mean()):.1f}",
+                        _a = _np.asarray(frame)[..., :3]
+                        print(f"[capture] frame {st.frame_index}: {frame.shape} "
+                              f"mean={float(_a.mean()):.1f} max={int(_a.max())}",
                               file=sys.stderr)
                     except Exception:
                         pass
