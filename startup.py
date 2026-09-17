@@ -510,7 +510,7 @@ def bring_up(st) -> None:
     # WNDO mode: the worker shows the frame, no pixels come back to Python.
     st.want_present = bool(st.cfg.get("worker_present", True))
     st.want_motion_small = bool(st.cfg.get("motion_on_gpu", True))
-    st.want_dda = bool(st.cfg.get("capture_in_worker", True))  # DDA: the worker takes the colour
+    st.want_dda = bool(st.cfg.get("capture_in_worker", False))  # DDA: the worker takes the colour
     # The result pixels come back through shared memory, not the pipe.
     st.want_out_shm = bool(st.cfg.get("pixels_in_shm", True))
     # System audio ("what you hear") as a second track in the recording.

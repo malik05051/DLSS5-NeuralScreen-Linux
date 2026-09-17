@@ -13,7 +13,7 @@
   "skin_structure": null,
   "worker_present": true,
   "motion_on_gpu": true,
-  "capture_in_worker": true,
+  "capture_in_worker": false,
   "menu_scale": 1.0,
   "menu_offset": [
     745,
