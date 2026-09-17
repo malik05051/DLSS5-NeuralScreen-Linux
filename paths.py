@@ -97,9 +97,18 @@ def config_path() -> Path:
     the program lives in /opt or /usr/share.
     """
     beside = BASE_DIR / "config.json"
-    if beside.is_file():
+    if beside.is_file() and os.access(beside, os.W_OK):
         return beside
-    return CONFIG_DIR / "config.json"
+    user = CONFIG_DIR / "config.json"
+    if beside.is_file() and not user.is_file():
+        # A packaged install: the defaults ship read-only beside the
+        # program, and the user's copy starts as those defaults.
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            user.write_bytes(beside.read_bytes())
+        except OSError:
+            pass
+    return user
 
 
 def log_path() -> Path:

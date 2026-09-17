@@ -471,6 +471,11 @@ class WaylandShell:
     # -- setup -------------------------------------------------------------
 
     def connect(self) -> bool:
+        # One connection per process: a Display rebuilt on a monitor switch
+        # reuses it. pump() drops self.display when the compositor is gone,
+        # and that is the one case a second connect actually connects.
+        if self.display is not None:
+            return True
         if os.environ.get("WAYLAND_DISPLAY", "") == "" and \
                 os.environ.get("WAYLAND_SOCKET", "") == "":
             print("[wayland] WAYLAND_DISPLAY is not set - this build needs a "
@@ -483,6 +488,21 @@ class WaylandShell:
             print(f"[wayland] could not connect: {exc}", file=sys.stderr)
             self.display = None
             return False
+        # Everything bound belongs to a connection. A second connect - the
+        # Display is rebuilt on a monitor switch, and again after a drop -
+        # must not carry the old one's proxies into the new registry walk:
+        # KWin advertises zxdg_output_manager_v1 before wl_output, and
+        # get_xdg_output on a stale output is "invalid arguments", which
+        # kills the new connection and starts the cycle over (15 fps with
+        # the overlay reconnecting every two seconds).
+        self.compositor = self.shm = self.seat = None
+        self.layer_shell = self.layer_surface_cls = self.layer_shell_cls = None
+        self.xdg_wm_base = self.xdg_output_manager = None
+        self.cursor_shape = self.cursor_device = None
+        self._pointer = self._keyboard = None
+        self.outputs = {}
+        self._surfaces = {}
+        self._focus = None
         registry = self.display.get_registry()
         registry.dispatcher["global"] = self._on_global
         registry.dispatcher["global_remove"] = self._on_global_remove
@@ -794,6 +814,14 @@ class WaylandShell:
             return True
         except Exception as exc:
             print(f"[wayland] the connection dropped: {exc}", file=sys.stderr)
+            # Disconnect what is left rather than just forgetting it: a
+            # wl_display freed by the garbage collector at interpreter exit
+            # is a segfault (pywayland 0.4.19), and Ctrl+C after a drop was
+            # exactly that.
+            try:
+                self.display.disconnect()
+            except Exception:
+                pass
             self.display = None
             return False
 
