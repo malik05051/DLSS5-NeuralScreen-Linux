@@ -1,0 +1,4 @@
+src/
+pkg/
+*.pkg.tar.*
+DLSS5-NeuralScreen-Linux/
