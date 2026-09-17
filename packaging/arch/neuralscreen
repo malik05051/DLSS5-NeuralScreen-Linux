@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# NeuralScreen, as installed by the neuralscreen package.
+#
+#   neuralscreen             run
+#   neuralscreen --setup     prepare the Proton side once (needs the DLL)
+#   neuralscreen --probe     the worker's verdict on this card
+#   neuralscreen --diag      run with the worker's phase profiler on
+#   neuralscreen --uninstall remove what the program wrote outside the package
+set -uo pipefail
+
+share=/usr/share/neuralscreen
+data="${XDG_DATA_HOME:-$HOME/.local/share}/neuralscreen"
+# The neural renderer's runtime and the Proton prefix live in the user's
+# data directory: the package cannot ship the first, and the second is
+# written to at run time. NS_NR_DLL and NS_PROTON_PREFIX override both.
+export NS_NR_DLL="${NS_NR_DLL:-$data/nvngx_dlssnr.dll}"
+export NS_PROTON_PREFIX="${NS_PROTON_PREFIX:-$data/pfx}"
+
+say() { printf '[NeuralScreen] %s\n' "$*" >&2; }
+die() {
+    say "$*"
+    # Launched from the application menu there is no terminal, and a
+    # notification is the only way the reason ever reaches the user.
+    if [[ ! -t 2 ]] && command -v notify-send >/dev/null 2>&1; then
+        notify-send --icon=neuralscreen --urgency=critical \
+            "NeuralScreen did not start" "$*"
+    fi
+    exit 1
+}
+
+need_runtime() {
+    [[ -f "$NS_NR_DLL" ]] || die "NVIDIA's neural renderer runtime is missing. Put your copy of
+nvngx_dlssnr.dll at
+  $data/nvngx_dlssnr.dll
+or point NS_NR_DLL at it, then run: neuralscreen --setup
+See /usr/share/doc/neuralscreen/README.md."
+}
+
+case "${1:-}" in
+--uninstall)
+    rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/autostart/neuralscreen.desktop" \
+          "${XDG_DATA_HOME:-$HOME/.local/share}/applications/neuralscreen.desktop"
+    echo "[NeuralScreen] autostart and the user desktop entry removed"
+    echo "[NeuralScreen] the prefix and the runtime: rm -r $data"
+    echo "[NeuralScreen] the package itself: pacman -R neuralscreen"
+    exit 0
+    ;;
+--setup)
+    need_runtime
+    if [[ ! -d "$NS_PROTON_PREFIX/drive_c" ]]; then
+        command -v umu-run >/dev/null || die "umu-run not found - install umu-launcher"
+        proton="${PROTONPATH:-}"
+        if [[ -z "$proton" ]]; then
+            proton="$(ls -d "$HOME"/.local/share/Steam/compatibilitytools.d/GE-Proton* 2>/dev/null | sort -V | tail -1 || true)"
+            proton="${proton##*/}"
+        fi
+        [[ -n "$proton" ]] || die "no GE-Proton under ~/.local/share/Steam/compatibilitytools.d - install one (Steam, ProtonUp-Qt, or proton-ge-custom-bin)"
+        say "preparing the Proton prefix at $NS_PROTON_PREFIX with $proton"
+        mkdir -p "$data"
+        WINEPREFIX="$NS_PROTON_PREFIX" PROTONPATH="$proton" GAMEID=umu-neuralscreen STORE=none \
+            UMU_NO_PROTON_UPDATE=1 umu-run wineboot -u || die "the prefix did not come up"
+    fi
+    exec "$share/native/linux/neuralscreen-host" --probe
+    ;;
+--probe)
+    exec "$share/native/linux/neuralscreen-host" --probe
+    ;;
+esac
+
+if [[ "${XDG_SESSION_TYPE:-}" != "wayland" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    die "this is a Wayland program and there is no Wayland session here
+(WAYLAND_DISPLAY is not set). Log in to a Wayland session and try again."
+fi
+need_runtime
+[[ -d "$NS_PROTON_PREFIX/drive_c" ]] || die "the Proton side is not set up yet - run: neuralscreen --setup"
+
+# Autostart written from the menu has to point at this wrapper, not at the
+# read-only copy of upstream's launcher inside the package.
+export NEURALSCREEN_LAUNCHER=/usr/bin/neuralscreen
+
+if [[ "${1:-}" == "--diag" ]]; then
+    export NS_PHASE=1
+    shift
+fi
+
+exec python "$share/main.py" "$@"

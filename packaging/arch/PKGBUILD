@@ -1,0 +1,68 @@
+# Maintainer: Malik <belhajjimalik1@gmail.com>
+#
+# NeuralScreen from git. The version is `git describe` style: base version
+# from build_release.py, then the commit count and hash, so a rebuild after
+# a pull is always newer than the one before it.
+#
+#   cd packaging/arch && makepkg -si
+#
+# What the package cannot ship: NVIDIA's nvngx_dlssnr.dll. The launcher
+# looks for it at ~/.local/share/neuralscreen/nvngx_dlssnr.dll (or NS_NR_DLL)
+# and `neuralscreen --setup` prepares the Proton prefix once.
+pkgname=neuralscreen
+pkgver=1.8.2.r324.g8184223
+pkgrel=1
+pkgdesc="NVIDIA's DLSS 5 neural renderer applied to the whole Wayland desktop"
+arch=('x86_64')
+url="https://github.com/malik05051/DLSS5-NeuralScreen-Linux"
+license=('MIT')
+depends=('python' 'python-numpy' 'python-opencv' 'python-pygame' 'python-av'
+         'python-pillow' 'python-jeepney' 'python-pywayland'
+         'libpipewire' 'libpulse' 'libxkbcommon' 'vulkan-icd-loader'
+         'nvidia-utils' 'xdg-desktop-portal' 'umu-launcher')
+makedepends=('git' 'gcc' 'vulkan-headers' 'mingw-w64-gcc')
+optdepends=('xdg-desktop-portal-hyprland: screen capture and global shortcuts on Hyprland'
+            'xdg-desktop-portal-wlr: screen capture on wlroots compositors'
+            'xdg-desktop-portal-kde: screen capture and global shortcuts on KDE'
+            'gst-plugin-pipewire: the Python-side capture fallback (capture_in_worker off)'
+            'proton-ge-custom-bin: the Proton the neural renderer runs under (or install GE-Proton through Steam)')
+source=("git+${url}.git#branch=main"
+        "neuralscreen"
+        "neuralscreen.desktop")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
+
+pkgver() {
+    cd "$srcdir/DLSS5-NeuralScreen-Linux"
+    local base
+    base="$(sed -n 's/^VERSION = "\(.*\)"/\1/p' build_release.py)"
+    printf '%s.r%s.g%s' "$base" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+    cd "$srcdir/DLSS5-NeuralScreen-Linux"
+    native/linux/build-host.sh
+    native/proton/build.sh
+}
+
+package() {
+    cd "$srcdir/DLSS5-NeuralScreen-Linux"
+    local share="$pkgdir/usr/share/neuralscreen"
+    install -d "$share/native/linux" "$share/native/proton" "$share/native/protocols" "$share/fonts"
+    for f in *.py config.json; do
+        case "$f" in build_release.py|verify_github.py) continue ;; esac
+        install -Dm644 "$f" "$share/$f"
+    done
+    install -Dm644 fonts/* -t "$share/fonts"
+    install -Dm755 native/linux/neuralscreen-host "$share/native/linux/neuralscreen-host"
+    install -Dm755 native/linux/libns-archspoof.so "$share/native/linux/libns-archspoof.so"
+    install -Dm755 native/proton/nvngx.dll_nr.exe "$share/native/proton/nvngx.dll_nr.exe"
+    install -Dm755 native/proton/nvngx.dll_gate.exe "$share/native/proton/nvngx.dll_gate.exe"
+    install -Dm644 native/proton/README.md "$share/native/proton/README.md"
+    install -Dm644 native/protocols/wlr-layer-shell-unstable-v1.xml -t "$share/native/protocols"
+    install -Dm644 native/neuralscreen.png "$share/native/neuralscreen.png"
+    install -Dm644 native/neuralscreen.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/neuralscreen.png"
+    install -Dm755 "$srcdir/neuralscreen" "$pkgdir/usr/bin/neuralscreen"
+    install -Dm644 "$srcdir/neuralscreen.desktop" "$pkgdir/usr/share/applications/neuralscreen.desktop"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md README.ru.md TECHNICAL.md TECHNICAL.ru.md docs/HDR.md -t "$pkgdir/usr/share/doc/$pkgname"
+}

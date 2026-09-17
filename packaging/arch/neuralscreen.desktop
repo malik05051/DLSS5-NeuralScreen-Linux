@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=NeuralScreen
+GenericName=Neural desktop renderer
+Comment=Run the whole desktop through NVIDIA's DLSS 5 neural renderer
+Exec=/usr/bin/neuralscreen
+Icon=neuralscreen
+Terminal=false
+Categories=Graphics;Utility;
+StartupNotify=false
+StartupWMClass=neuralscreen
+X-GNOME-UsesNotifications=false
