@@ -491,7 +491,7 @@ class Display:
 
     # -- public API -------------------------------------------------------
 
-    def set_menu_input(self, enabled: bool) -> None:
+    def set_menu_input(self, enabled: bool, keyboard: bool = True) -> None:
         """Whether input should reach our layer (while the menu is open).
 
         Two requests, matching the two Windows styles this replaces: the
@@ -509,7 +509,12 @@ class Display:
         """
         self._menu_input = bool(enabled)
         self._overlay.set_click_through(not enabled)
-        self._overlay.set_keyboard(enabled)
+        # keyboard is separable from pointer input: grabbing the keyboard
+        # exclusively at an auto-open would take it from the terminal that
+        # launched us, so Ctrl+C never arrives. The menu is fully usable
+        # with the mouse; the grab is worth taking only when the user opened
+        # it themselves.
+        self._overlay.set_keyboard(enabled and keyboard)
         self._click_through = not enabled
 
     def resize(self, w: int, h: int) -> None:

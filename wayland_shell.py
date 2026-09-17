@@ -688,7 +688,17 @@ class WaylandShell:
         self._surfaces.pop(surface, None)
 
     def _target(self, surface):
-        return self._surfaces.get(surface)
+        overlay = self._surfaces.get(surface)
+        if overlay is not None:
+            return overlay
+        # pywayland can hand the enter/button event a different proxy object
+        # than the one the surface was registered under, and dict identity
+        # then misses - clicks land nowhere and the menu cannot be closed.
+        # With a single overlay (the normal case) there is no ambiguity about
+        # which surface the event is for.
+        if len(self._surfaces) == 1:
+            return next(iter(self._surfaces.values()))
+        return None
 
     # -- pointer -----------------------------------------------------------
 
@@ -730,10 +740,18 @@ class WaylandShell:
         if not index:
             return
         kind = pygame.MOUSEBUTTONDOWN if state else pygame.MOUSEBUTTONUP
+        delivered = False
         for overlay in self._surfaces.values():
             if overlay._pointer_in:
                 overlay._push(pygame.event.Event(
                     kind, pos=self._pointer_pos, button=index, touch=False))
+                delivered = True
+        # A button with no pointer-enter behind it (the proxy-identity miss
+        # above) would otherwise vanish - and a menu that cannot be clicked
+        # cannot be closed. Deliver to the sole overlay.
+        if not delivered and len(self._surfaces) == 1:
+            next(iter(self._surfaces.values()))._push(pygame.event.Event(
+                kind, pos=self._pointer_pos, button=index, touch=False))
 
     def _ptr_axis(self, pointer, time_ms, axis, value) -> None:
         if axis != 0:       # 0 is vertical scroll; horizontal is ignored
