@@ -473,8 +473,9 @@ header's flag field, so moving the slider does not recreate the worker.
 
 ## What did not come across
 
-Three things the Windows build had and this one does not. Each is here
-because a known gap is not the same thing as a bug report.
+Things the Windows build had that this one does differently, or not at
+all. Each is here because a known gap is not the same thing as a bug
+report.
 
 ### The architecture spoof — gone, and pre-Blackwell cards with it
 
@@ -599,12 +600,74 @@ had to hide from screen capture, so an external recorder could not see the
 picture at all; here an ordinary OBS Screen Capture source on the same
 monitor sees exactly what the user sees.
 
-### The worker has never run against hardware
+### The neural renderer runs through Proton
+
+This is the one thing the port could not make native, and the reason is
+worth stating exactly, because it was measured rather than assumed.
+
+NVIDIA's DLSSNR exists as `nvngx_dlssnr.dll`, a D3D12 library, and as
+nothing else. The Linux NGX core (`libnvidia-ngx.so.1`, driver 615) knows
+the feature by name — `DLSSNR.Available` is in its strings — but it has no
+snippet for it, and it never looks beside the application for one: it
+reads `nvidia-ngx-conf.json`, looks in `ngx_models_path`
+(`/usr/share/nvidia/ngx`), and asks `nvidia-ngx-updater` to fill that from
+`ngx.download.nvidia.com`. That server is a publicly listable bucket, and
+it holds no `dlssnr` family for any platform, empty Linux manifests, and
+only Windows PE blobs for the features it does have. `neuralscreen-host
+--probe` shows the local half of this: every `*.Available` capability 0,
+`FAIL_UnableToInitializeFeature` for feature ids 0–18.
+
+So the network runs where the DLL can run. `native/proton/nvngx.dll_nr.exe`
+is a small Windows program, cross-built with MinGW, that owns a D3D12
+device through vkd3d-proton, loads the DLL exactly as the Windows worker
+did (NGX core `Init`, the DLL's own `Init_Ext`, `CreateFeature(18)`,
+`EvaluateFeature` — the calls are the DLL's exports, not the core's), and
+evaluates frames the Linux host puts in a shared mapping. The host side is
+`native/linux/ns_proton.cpp`: it forks GE-Proton's `wine`, talks to the
+child over stdin/stdout with the fixed structs in
+`native/proton/ns_nr_wire.h`, and moves pixels through one file on
+`/dev/shm` that Wine maps to the same pages. Per frame: a blit (16-bit
+float to RGBA8), a readback and an upload on the Vulkan side, and the
+mirror image on the D3D12 side. `Host::ensure_feature` tries native NGX
+first and falls back to this; the day NVIDIA publishes a Linux snippet,
+nothing here needs to change and the log will say "runs natively".
+
+Three things had to be learned for it to work, all recorded in the code:
+
+* **The architecture check is answered by dxvk-nvapi.** The DLL asks nvapi
+  for the GPU architecture and refuses anything below 0x1B0. Under Proton
+  nvapi is dxvk-nvapi, and `DXVK_NVAPI_GPU_ARCH=GB200` makes it report
+  0x1B0. No memory patching, no NVML shim on this path — the shim in
+  `ns_archspoof.c` still serves the native core, which asks through NVML.
+* **`NVSDK_NGX_Parameter` is an MSVC interface.** Its overloaded `Set()`
+  methods sit in the vtable in the reverse of declaration order; GCC
+  assumes declaration order, so a MinGW build calling
+  `Set(ID3D12Resource*)` lands in `Set(float)` and the runtime sees no
+  colour and no output. Both Windows-side programs address the vtable by
+  MSVC index.
+* **The caller's file name must contain `nvngx.dll`.** The runtime
+  resolves its caller from the return address and refuses any other
+  module. Wine will not execute a file named `*.dll`, so the programs are
+  `nvngx.dll_nr.exe` and `nvngx.dll_gate.exe`.
+
+Measured on an RTX 3050 Laptop GPU (driver 615.71.09, GE-Proton 11-5,
+vkd3d-proton 3.0.1, dxvk-nvapi 0.9.2): feature creation 3–8 s, then
+48–64 ms per 720p frame through the whole round trip, ~130 ms at 1080p;
+the desktop pipeline settles at 24–25 fps with the network at 1248×702.
+`native/proton/setup.sh` builds the exe, bootstraps the prefix with
+`umu-run` (which is what copies the driver's `_nvngx.dll`, vkd3d-proton,
+DXVK's dxgi and dxvk-nvapi into it) and ends with the probe's verdict.
+`NS_NR_EXE`, `NS_NR_DLL`, `NS_PROTON_WINE`, `NS_PROTON_PREFIX` and
+`NS_PROTON_ARCH` override where each piece is.
+
+### The worker has now run against hardware
 
 The C++ half was rewritten from D3D11/D3D12 to Vulkan: the device, the
-image imports, the NGX feature and the PipeWire consumer. It compiles, and
-`neuralscreen-host --probe` fails cleanly on a machine with no NVIDIA
-device. It has not been run on a machine with one.
+image imports, the NGX feature and the PipeWire consumer. It was written
+on a machine with no NVIDIA device; it has since run on an RTX 3050 on KDE
+Wayland, and two things it got wrong were fixed on the first live run (the
+layer enum under pywayland 0.4.19, and the inline motion field in DDA
+mode that the worker never read).
 
 The parts most likely to need work are named here so nobody has to find
 them by bisection:
