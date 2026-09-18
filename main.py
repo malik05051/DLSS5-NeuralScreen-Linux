@@ -528,15 +528,25 @@ def main() -> int:
                 settings_io.warn_hdr(st)
 
             # --- Input for the overlay menu --------------------------
-            # Events are read only while the menu is open: the rest of the
-            # time the window is click-through, there are no events, and an
-            # extra get() would eat the queue from pump() inside drawing.
-            if st.display.menu.visible:
-                for ev in pygame.event.get():
+            # The events come from the compositor through wayland_shell,
+            # NOT from SDL: this build has no SDL window, so the
+            # pygame.event.get() this line used to call was always empty
+            # and every click on the menu was dropped on the floor.
+            # Drained on every frame rather than only while the menu is
+            # open: a queue nobody reads only grows, and the compositor's
+            # "your surface is gone" arrives here as QUIT.
+            for ev in st.display.menu_events():
+                if ev.type == pygame.QUIT:
+                    print("[main] the compositor closed the overlay")
+                    st.running = False
+                    break
+                if st.display.menu.visible:
                     for action in st.display.menu.handle_event(ev):
                         commands.apply_menu_action(st, action)
-                if not st.display.menu.dragging:
-                    st.display.menu.set_state(settings_io.menu_payload(st))
+            if not st.running:
+                break
+            if st.display.menu.visible and not st.display.menu.dragging:
+                st.display.menu.set_state(settings_io.menu_payload(st))
 
             # --- Grab ahead: while NGX computes frame N we grab N+1 -------
             # work_frame == None happens on the first frame, after a worker
