@@ -248,6 +248,7 @@ struct Host {
 
     // Capture state.
     bool capture_active = false;
+    bool output_valid = false;  // `output` holds a real frame (see run_frame)
     uint32_t motion_src_w = 0, motion_src_h = 0;   // MOTS: the flow size
 
     // The newest captured frame, handed over by the PipeWire thread.
@@ -303,6 +304,7 @@ bool Host::build_resources()
         log("[host] could not create the output image %ux%u", io_w, io_h);
         return false;
     }
+    output_valid = false;  // a fresh image holds nothing to skip back to
     // The motion field: two half floats per pixel at the work resolution.
     if (!device.make_image(motion, work_w, work_h, VK_FORMAT_R16G16_SFLOAT,
                            VK_IMAGE_USAGE_STORAGE_BIT)) {
@@ -594,8 +596,11 @@ bool Host::run_frame(const NsFrame &frame, uint32_t *ngx_result)
 
     // Nothing changed and Python says so: the picture on screen is already
     // right, and re-running the network on an identical frame is the one
-    // cost with no benefit at all.
-    if (frame.flags & FRAME_FLAG_SKIP_STATIC) {
+    // cost with no benefit at all. But only once there IS a picture - on the
+    // first frames `output` is an empty image, and handing that back reads
+    // as a black, fully transparent screen (the overlay went black while the
+    // frame counter kept climbing).
+    if ((frame.flags & FRAME_FLAG_SKIP_STATIC) && output_valid) {
         *ngx_result = nr_result();
         return true;
     }
@@ -607,7 +612,9 @@ bool Host::run_frame(const NsFrame &frame, uint32_t *ngx_result)
         VkCommandBuffer cmd = device.begin();
         if (cmd == VK_NULL_HANDLE) return false;
         device.blit(cmd, color, output, false);
-        return device.submit_and_wait(cmd);
+        const bool copied = device.submit_and_wait(cmd);
+        output_valid = output_valid || copied;
+        return copied;
     }
 
     if (!ensure_feature()) {
@@ -618,6 +625,7 @@ bool Host::run_frame(const NsFrame &frame, uint32_t *ngx_result)
         const bool ok = proton.evaluate(device, color, output, motion, options,
                                         frame.reset != 0);
         *ngx_result = proton.last_result();
+        output_valid = output_valid || ok;
         return ok;
     }
     VkCommandBuffer cmd = device.begin();
@@ -626,6 +634,7 @@ bool Host::run_frame(const NsFrame &frame, uint32_t *ngx_result)
                                  frame.reset != 0);
     *ngx_result = ngx.last_result();
     const bool submitted = device.submit_and_wait(cmd);
+    output_valid = output_valid || (ok && submitted);
     return ok && submitted;
 }
 
