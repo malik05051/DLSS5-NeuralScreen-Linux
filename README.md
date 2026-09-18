@@ -33,7 +33,7 @@ middle so you can see what the effect is actually doing.*
   |---|---|
   | **Hyprland**, **sway**, **niri**, **Wayfire** | ✅ full overlay; window-follow works on Hyprland and sway |
   | **KDE Plasma 6** | ✅ full overlay, tray, global shortcuts |
-  | **GNOME 46+** | ⚠️ works, but the overlay is an ordinary window: it takes focus, it is not click-through, and it will not stay over a fullscreen game. Mutter does not implement layer-shell. |
+  | **GNOME 46+** | ⚠️ works, but the overlay is an ordinary window: it takes focus, it is not click-through, and it will not stay over a fullscreen game. Mutter does not implement layer-shell. Needs testers to test in GNOME.|
 
 - **An NVIDIA RTX card:**
 
