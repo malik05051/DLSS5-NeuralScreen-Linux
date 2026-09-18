@@ -41,6 +41,7 @@ import ctypes
 import ctypes.util
 import mmap
 import os
+import select
 import sys
 import tempfile
 import threading
@@ -50,6 +51,16 @@ import numpy as np
 import pygame
 
 import wlproto
+
+# Input diagnostics: NS_DEBUG_INPUT=1 traces every pointer event the
+# compositor hands this process. Off by default and silent - the only way
+# to tell "the overlay refuses clicks" from "the clicks never arrived".
+_DEBUG_INPUT = os.environ.get("NS_DEBUG_INPUT") == "1"
+
+
+def _dbg(fmt, *args) -> None:
+    if _DEBUG_INPUT:
+        print("[input] " + (fmt % args), file=sys.stderr, flush=True)
 
 from pywayland.client import Display as WlDisplay
 from pywayland.protocol.wayland import (WlCompositor, WlOutput, WlSeat, WlShm,
@@ -702,8 +713,11 @@ class WaylandShell:
 
     # -- pointer -----------------------------------------------------------
 
+
     def _ptr_enter(self, pointer, serial, surface, x, y) -> None:
         self.serial = serial
+        _dbg("enter surface=%s at %d,%d -> %s", surface, int(x), int(y),
+             self._target(surface))
         self._pointer_pos = (int(x), int(y))
         overlay = self._target(surface)
         if overlay is not None:
@@ -714,12 +728,14 @@ class WaylandShell:
             overlay._set_cursor(pointer, serial)
 
     def _ptr_leave(self, pointer, serial, surface) -> None:
+        _dbg("leave surface=%s", surface)
         self.serial = serial
         overlay = self._target(surface)
         if overlay is not None:
             overlay._pointer_in = False
 
     def _ptr_motion(self, pointer, time_ms, x, y) -> None:
+        _dbg("motion %d,%d", int(x), int(y))
         prev = self._pointer_pos
         self._pointer_pos = (int(x), int(y))
         for overlay in self._surfaces.values():
@@ -736,6 +752,9 @@ class WaylandShell:
         # numbers them 1, 3, 2 - the middle and right are the other way
         # round, which is the kind of thing that silently swaps a context
         # menu for a paste.
+        _dbg("button 0x%X state=%s at %s, surfaces=%d, pointer_in=%s",
+             button, state, self._pointer_pos, len(self._surfaces),
+             [o._pointer_in for o in self._surfaces.values()])
         index = {0x110: 1, 0x111: 3, 0x112: 2}.get(button, 0)
         if not index:
             return
@@ -828,7 +847,19 @@ class WaylandShell:
             return False
         try:
             self.display.flush()
+            # dispatch(block=False) processes what is ALREADY queued and, in
+            # pywayland's own words, "does not attempt to read the display
+            # fd". On its own it therefore never sees a single pointer or key
+            # event: those are sitting on the socket, unread, and the menu
+            # cannot be clicked. So the socket is drained here while it has
+            # anything to give - select() first, so the blocking dispatch
+            # that actually reads never blocks.
             self.display.dispatch(block=False)
+            fd = self.display.get_fd()
+            for _ in range(64):   # bounded: a frame must not stall on input
+                if not select.select([fd], [], [], 0)[0]:
+                    break
+                self.display.dispatch(block=True)
             return True
         except Exception as exc:
             print(f"[wayland] the connection dropped: {exc}", file=sys.stderr)
@@ -984,15 +1015,22 @@ class Overlay:
         An empty region means no part of this surface accepts input, so
         every click lands on whatever is underneath - the exact behaviour
         WS_EX_TRANSPARENT gave, and without the WS_EX_LAYERED trick it
-        needed on Windows. Passing None instead would mean the opposite:
-        NULL is "the whole surface", the protocol's default.
+        needed on Windows.
+
+        The other half is spelled out rather than passed as NULL. The
+        protocol says a null region is "the whole surface", but pywayland
+        0.4.19 does not marshal None to that: the compositor ends up sending
+        this surface no pointer events at all, and the menu cannot be
+        clicked - verified against KWin, where an explicit rectangle gets
+        wl_pointer.enter and None gets silence. So the region is always a
+        real object, and the "whole surface" case is a rectangle of the
+        surface's own size.
         """
-        if self._click_through:
-            region = self._shell.compositor.create_region()   # empty
-            self.surface.set_input_region(region)
-            region.destroy()
-        else:
-            self.surface.set_input_region(None)
+        region = self._shell.compositor.create_region()
+        if not self._click_through:
+            region.add(0, 0, max(1, int(self.width)), max(1, int(self.height)))
+        self.surface.set_input_region(region)
+        region.destroy()
 
     def set_click_through(self, enabled: bool) -> None:
         if enabled == self._click_through:
