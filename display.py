@@ -1239,6 +1239,34 @@ class Display:
             self._draw_switch()
         self._present()
 
+    def _sync_input_region(self) -> None:
+        """Take clicks only where the menu is, not across the whole screen.
+
+        The overlay covers the desktop, so a surface that accepts input
+        everywhere swallows every click the user makes - the menu works and
+        nothing else does (user: "the desktop isn't clickable when
+        neuralscreen is running"). The menu panel is the only interactive
+        thing the overlay draws; the HUD, the alerts and the veil are not.
+
+        While the panel is being dragged or resized the region opens up to
+        the whole surface: the pointer leaves the panel during a drag, and a
+        compositor stops sending motion once it is outside the region, which
+        would drop the panel wherever the pointer crossed the edge.
+        """
+        if not self._menu_input or not self.menu.visible:
+            self._overlay.set_input_rects([])
+            return
+        # Every way the pointer can be holding on to the panel: a slider
+        # (menu.dragging), the title bar, the corner grip and the bottom
+        # edge. Each one tracks the pointer well outside the panel.
+        if self.menu.dragging or any(
+                getattr(self.menu, name, None) is not None
+                for name in ("_move_from", "_resize_from", "_resize_h_from")):
+            self._overlay.set_input_rects([])
+            return
+        r = self.menu.panel_rect
+        self._overlay.set_input_rects([(r.x, r.y, r.w, r.h)])
+
     def _present(self) -> None:
         """Hand the drawn surface to the compositor.
 
@@ -1248,6 +1276,7 @@ class Display:
         no alpha to premultiply.
         """
         try:
+            self._sync_input_region()
             self._overlay.present(self.screen,
                                   opaque=not self._hud_only
                                   and self._layer_alpha >= 255,
