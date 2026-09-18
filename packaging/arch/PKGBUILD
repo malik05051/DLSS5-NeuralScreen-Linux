@@ -19,13 +19,19 @@ license=('MIT')
 depends=('python' 'python-numpy' 'python-opencv' 'python-pygame' 'python-av'
          'python-pillow' 'python-jeepney' 'python-pywayland'
          'libpipewire' 'libpulse' 'libxkbcommon' 'vulkan-icd-loader'
-         'nvidia-utils' 'xdg-desktop-portal' 'umu-launcher')
+         'nvidia-utils' 'xdg-desktop-portal')
 makedepends=('git' 'gcc' 'vulkan-headers' 'mingw-w64-gcc')
 optdepends=('xdg-desktop-portal-hyprland: screen capture and global shortcuts on Hyprland'
             'xdg-desktop-portal-wlr: screen capture on wlroots compositors'
             'xdg-desktop-portal-kde: screen capture and global shortcuts on KDE'
             'gst-plugin-pipewire: the Python-side capture fallback (capture_in_worker off)'
-            'proton-ge-custom-bin: the Proton the neural renderer runs under (or install GE-Proton through Steam)')
+            'proton-ge-custom-bin: the Proton the neural renderer runs under (or install GE-Proton through Steam)'
+            # Not a hard dependency: it bootstraps the Wine prefix once, in
+            # `neuralscreen --setup`. The program itself runs GE-Proton's
+            # wine directly and never calls umu-run. It also lives outside
+            # the official repositories, so a hard dependency cannot be
+            # resolved in a plain Arch build container at all.
+            'umu-launcher: bootstraps the Proton prefix for `neuralscreen --setup`')
 source=("git+${url}.git#branch=main"
         "neuralscreen"
         "neuralscreen.desktop")
