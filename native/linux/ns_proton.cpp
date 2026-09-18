@@ -96,13 +96,21 @@ bool ProtonNr::locate(const std::string &exe_dir, std::string *exe,
     if (const char *v = getenv("NS_PROTON_PREFIX")) p = v;
     else p = home_dir() + "/.local/share/neuralscreen/pfx";
 
-    // The runtime: NS_NR_DLL for a swapped-in build, else beside the exe.
+    // The runtime: NS_NR_DLL for a swapped-in build, else beside the exe,
+    // else where the packaged app keeps it. The 158 MB DLL is not in the
+    // repository (it is NVIDIA's, and nobody wants it in a git tree), so a
+    // run straight from a checkout has to find the installed copy or it
+    // silently loses the neural renderer.
     std::string dll;
     if (const char *v = getenv("NS_NR_DLL")) dll = v;
-    else if (!e.empty()) {
-        const size_t slash = e.rfind('/');
-        dll = (slash == std::string::npos ? std::string(".") : e.substr(0, slash))
-              + "/nvngx_dlssnr.dll";
+    else {
+        const std::string shared = home_dir() + "/.local/share/neuralscreen/nvngx_dlssnr.dll";
+        if (!e.empty()) {
+            const size_t slash = e.rfind('/');
+            dll = (slash == std::string::npos ? std::string(".") : e.substr(0, slash))
+                  + "/nvngx_dlssnr.dll";
+        }
+        if ((dll.empty() || !is_file(dll)) && is_file(shared)) dll = shared;
     }
     if (describe) {
         *describe = "exe: " + (e.empty() ? std::string("not found") : e)

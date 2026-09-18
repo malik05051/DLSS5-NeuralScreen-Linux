@@ -568,11 +568,12 @@ def main() -> int:
                 else:
                     frame = np.ascontiguousarray(frame, dtype=np.uint8)
                 st.work_frame = frame
-                if st.frame_index < 5:
+                if st.frame_index < 15 or st.frame_index % 30 == 0:
                     try:
                         import numpy as _np
-                        print(f"[capture] frame {st.frame_index}: "
-                              f"{frame.shape} mean={float(_np.asarray(frame)[..., :3].mean()):.1f}",
+                        _a = _np.asarray(frame)[..., :3]
+                        print(f"[capture] frame {st.frame_index}: {frame.shape} "
+                              f"mean={float(_a.mean()):.1f} max={int(_a.max())}",
                               file=sys.stderr)
                     except Exception:
                         pass
@@ -618,7 +619,15 @@ def main() -> int:
                            no_color=bool(st.dda_mode),
                            bypass=bypass,
                            split=st.split_pos,
-                           skip_static=bool(st.cfg.get("skip_static", True)))
+                           # "Nothing changed" is only ever true when the
+                           # WORKER captures: it is the side that sees the
+                           # capture time out on a still screen. When Python
+                           # grabs (the Wayland/GStreamer path), the frame in
+                           # our hands was just captured - claiming it is
+                           # stale makes the worker idle on every single
+                           # frame and return an empty result forever.
+                           skip_static=(bool(st.dda_mode)
+                                        and bool(st.cfg.get("skip_static", True))))
                 _perf("send", t0)
             except (BrokenPipeError, OSError, EOFError, RuntimeError) as exc:
                 st.consecutive_restarts += 1
@@ -777,6 +786,15 @@ def main() -> int:
             st.consecutive_restarts = 0
             status = "NR OFF" if st.paused else "NR ON"
             st.pts += 1
+            if st.frame_index < 15 or st.frame_index % 30 == 0:
+                if st.output_rgba is None:
+                    print(f"[result] frame {st.frame_index}: no pixels (present_mode={st.present_mode})",
+                          file=sys.stderr)
+                else:
+                    import numpy as _np
+                    _r = _np.asarray(st.output_rgba)[..., :3]
+                    print(f"[result] frame {st.frame_index}: {st.output_rgba.shape} "
+                          f"mean={float(_r.mean()):.1f} max={int(_r.max())}", file=sys.stderr)
 
             t0 = time.perf_counter()
             try:

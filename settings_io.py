@@ -646,6 +646,28 @@ def save_menu_layout(st) -> bool:
         return False
 
 
+def save_restore_token(st, token: str) -> bool:
+    """Remember the portal's restore token so the next launch is silent.
+
+    Without this the xdg-desktop-portal screen-sharing dialog comes up on
+    EVERY start and the program cannot be launched unattended - the user has
+    to be at the keyboard to approve a capture they already approved. The
+    token is the portal's own handle for that grant; it is useless to anyone
+    else and the portal revokes it when the user withdraws the permission.
+    """
+    try:
+        data = json.loads(st.cfg_path.read_text(encoding="utf-8"))
+        if data.get("capture_restore_token", "") == token:
+            return True
+        data["capture_restore_token"] = token
+        _atomic_write_json(st.cfg_path, data)
+        return True
+    except Exception as exc:
+        print(f"[main] could not save the capture permission: {exc}",
+              file=sys.stderr)
+        return False
+
+
 def save_hotkeys(st, mapping: dict) -> bool:
     """Write the assignments into config.json.
 

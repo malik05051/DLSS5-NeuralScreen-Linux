@@ -29,6 +29,7 @@ import threading
 
 import numpy as np
 
+import capture as capture_mod
 from capture import ScreenCapture, resolve_output_idx
 from display import Display
 from gpuinfo import describe as gpu_describe, probe as gpu_probe
@@ -42,7 +43,7 @@ from pipeline import start_worker
 from protocol import SharedFrameBuffer, WorkerReader
 from recorder import VideoRecorder
 from settings_io import (APP_VERSION, _work_size, hotkey_labels, load_config,
-                         load_presets, resolve_params)
+                         load_presets, resolve_params, save_restore_token)
 from taskbar import TaskbarWindow
 from tray import TrayController
 
@@ -309,7 +310,14 @@ def configure(st) -> None:
     # config.json (the monitor may have been switched to 1440p while the
     # config still remembers 4K - the overlay, the recording and the worker
     # window would start drifting away from the screen).
+    # The portal's grant from last time. Without it the screen-sharing
+    # dialog comes up on every launch and the program cannot start
+    # unattended - autostart, a remote session, or simply a user who already
+    # said yes once.
+    capture_mod.set_restore_token(str(st.cfg.get("capture_restore_token", "")))
     st.capture = ScreenCapture(monitor_idx=st.monitor)
+    if capture_mod.restore_token():
+        save_restore_token(st, capture_mod.restore_token())
     st.mon_w, st.mon_h = st.capture.resolution
     if st.mon_w > 0 and st.mon_h > 0 and (st.mon_w, st.mon_h) != (st.width, st.height):
         print(f"[main] monitor {st.monitor} is {st.mon_w}x{st.mon_h} (config: {st.width}x{st.height}), "
