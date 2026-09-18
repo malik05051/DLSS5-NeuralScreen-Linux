@@ -534,6 +534,12 @@ def bring_up(st) -> None:
     st.dda_mode = False          # the worker captures the screen itself
     st.dda_attempted = False     # already tried for the current worker (do not spam)
     st.window_hwnd = None        # WGCW target; None = the whole desktop (DDA1)
+    # Keep the overlay out of its own capture. Only _rebuild_pipeline used
+    # to ask, so on a normal start nobody did, and the program spent the
+    # whole session re-processing its own output (issue #9). Here rather
+    # than beside the Display: window_hwnd is the flag, and it is born on
+    # the line above.
+    st.display.set_excluded_from_capture(st.window_hwnd is None)
     st.last_foreground = 0       # the last focused window that was not ours
     st.follow_pos = None         # where the overlay currently sits (window mode)
     st.follow_resize = None      # a pending size change, waiting to settle

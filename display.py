@@ -85,6 +85,8 @@ def system_cursor_visible() -> bool:
 import numpy as np
 import pygame
 
+import kwin_capture
+
 import fonts
 import toplevels
 import wayland_shell
@@ -468,26 +470,29 @@ class Display:
         return self.set_excluded_from_capture(True)
 
     def set_excluded_from_capture(self, hide: bool) -> bool:
-        """A no-op here, because the problem it solved cannot occur.
+        """Keep the overlay out of the screen capture. True when it worked.
 
         WDA_EXCLUDEFROMCAPTURE existed for one reason: Desktop Duplication
         captured the whole composited screen, our overlay included, so the
-        pipeline would have fed its own output back into itself. The portal
-        does not work that way - it grants one source, and the compositor
-        composes that source without us in it when we are a layer surface
-        on top of it rather than a window inside it.
+        pipeline fed its own output back into itself. This used to be a
+        no-op here, on the belief that the portal grants a source composed
+        without us in it because we are a layer surface rather than a
+        window. That belief was wrong: KWin streams the finished composite,
+        layer surfaces and all, and the loop was real - the result's mean
+        brightness stepped the moment the overlay appeared in its own
+        capture and climbed from there, with ghosting to match (issue #9).
 
-        The Windows flag also had a cost the README had to explain: it hid
-        the overlay from OBS and stopped the NVIDIA App recording
-        altogether, so one-window mode had to drop it. That trade is gone
-        with the flag - an external recorder capturing the same output sees
-        exactly what the user sees.
-
-        Returns True so the callers' logging stays truthful about the state
-        they asked for.
+        Wayland has no protocol for the Windows flag, so the exclusion is
+        asked of KWin directly; kwin_capture says how, and what happens on
+        a compositor that cannot do it.
         """
         self._excluded = bool(hide)
-        return True
+        if not hide:
+            # Nothing to undo: the surfaces this was set on are gone by the
+            # time anyone asks for the opposite, and a window that is not
+            # excluded is the default.
+            return True
+        return kwin_capture.exclude_self()
 
     # -- public API -------------------------------------------------------
 
@@ -1292,6 +1297,7 @@ class Display:
         return self._overlay.poll()
 
     def close(self) -> None:
+        kwin_capture.release()
         self._overlay.close()
         SHELL.close()
         pygame.quit()
