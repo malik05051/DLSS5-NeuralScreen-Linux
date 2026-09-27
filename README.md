@@ -1,5 +1,8 @@
 # NeuralScreen
 
+> [!IMPORTANT]
+> Packages releases are on the [GitHub pacman repo](https://github.com/malik05051/malik05-repo).
+
 **NVIDIA's DLSS 5 neural renderer, applied to your whole Wayland desktop in
 real time.** Everything on screen — games, video, photos — goes through the
 same neural network that DLSS 5 games use, and comes back sharper.
