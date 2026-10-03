@@ -924,6 +924,11 @@ class Overlay:
         self._click_through = click_through
         # Surface-local rectangles that accept input; empty = all of it.
         self._input_rects: list[tuple[int, int, int, int]] = []
+        # Whole-surface input, asked for explicitly. It is never the default:
+        # an overlay the size of the desktop that accepts input everywhere
+        # swallows every click the user makes, so "we do not know what is
+        # clickable yet" has to mean none of it rather than all of it.
+        self._input_all = False
         self._keyboard = False
         self._layer_surface = None
         self._xdg_surface = None
@@ -1030,31 +1035,45 @@ class Overlay:
         """
         region = self._shell.compositor.create_region()
         if not self._click_through:
-            if self._input_rects:
-                # Only where something can actually be clicked. A region
-                # covering the whole surface would take every click on the
-                # screen while the menu is open, and the desktop under the
-                # overlay would stop responding.
-                for x, y, w, h in self._input_rects:
-                    region.add(int(x), int(y), int(w), int(h))
-            else:
+            if self._input_all:
+                # Asked for by name, and only for a drag: the pointer leaves
+                # the panel while it is being moved or a slider dragged, and
+                # a compositor stops sending motion once it is outside the
+                # region.
                 region.add(0, 0, max(1, int(self.width)),
                            max(1, int(self.height)))
+            else:
+                # Only where something can actually be clicked. With no
+                # rectangles the region stays empty, so clicks go to the
+                # desktop - the safe direction to fail in, and the one that
+                # keeps the session usable if the panel's geometry is not
+                # known yet (panel_rect is 0x0 until the menu's first draw).
+                for x, y, w, h in self._input_rects:
+                    region.add(int(x), int(y), int(w), int(h))
         self.surface.set_input_region(region)
         region.destroy()
 
     def set_input_rects(self, rects) -> None:
         """The parts of the surface that accept input, surface-local.
 
-        Empty means the whole surface, which is what a drag needs: once the
+        None means the whole surface, which is what a drag needs: once the
         pointer leaves the panel the compositor stops sending motion to a
         region that no longer contains it, and the menu would be dropped
         mid-drag.
+
+        An empty list means no part of it, and that is deliberately a
+        different thing from None. The two used to be the same value, which
+        is how the overlay came to take every click on the screen the
+        instant the menu opened: nothing had told it where the panel was
+        yet, and "nowhere" was read as "everywhere".
         """
-        clean = [(int(x), int(y), int(w), int(h))
-                 for x, y, w, h in rects if w > 0 and h > 0]
-        if clean == self._input_rects:
+        want_all = rects is None
+        clean = [] if want_all else [
+            (int(x), int(y), int(w), int(h))
+            for x, y, w, h in rects if w > 0 and h > 0]
+        if want_all == self._input_all and clean == self._input_rects:
             return
+        self._input_all = want_all
         self._input_rects = clean
         self._apply_input_region()
         self.surface.commit()

@@ -513,6 +513,14 @@ class Display:
         asking. The game underneath never loses its own focus.
         """
         self._menu_input = bool(enabled)
+        # Before click-through comes off, not after. Dropping click-through
+        # applies whatever region is current, and until this runs that is
+        # the region from when the menu was last closed. Syncing first means
+        # the surface never spends a moment accepting input over the whole
+        # screen - the window the desktop froze in, which lasted as long as
+        # the menu stayed open whenever the next frame was skipped as
+        # unchanged (skip_static) rather than presented.
+        self._sync_input_region()
         self._overlay.set_click_through(not enabled)
         # keyboard is separable from pointer input: grabbing the keyboard
         # exclusively at an auto-open would take it from the terminal that
@@ -1258,13 +1266,20 @@ class Display:
             return
         # Every way the pointer can be holding on to the panel: a slider
         # (menu.dragging), the title bar, the corner grip and the bottom
-        # edge. Each one tracks the pointer well outside the panel.
+        # edge. Each one tracks the pointer well outside the panel, so this
+        # is the one case that wants the whole surface - asked for by name.
         if self.menu.dragging or any(
                 getattr(self.menu, name, None) is not None
                 for name in ("_move_from", "_resize_from", "_resize_h_from")):
-            self._overlay.set_input_rects([])
+            self._overlay.set_input_rects(None)
             return
         r = self.menu.panel_rect
+        # 0x0 until the menu's first draw has laid the panel out. Taking no
+        # input until then leaves the desktop working; the next frame, one
+        # at most, makes the panel clickable.
+        if r.w <= 0 or r.h <= 0:
+            self._overlay.set_input_rects([])
+            return
         self._overlay.set_input_rects([(r.x, r.y, r.w, r.h)])
 
     def _present(self) -> None:
