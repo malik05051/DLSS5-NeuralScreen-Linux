@@ -568,4 +568,8 @@ def bring_up(st) -> None:
     st.pending_apply: tuple | None = None  # the deferred (scale, profile, params)
     st.next_auto_revive = 0.0      # monotonic deadline; 0 = no revive pending
     st.consecutive_restarts = 0
+    # When the worker was last brought back after a failure. The restart
+    # counter is cleared by a frame, but only once the worker has stayed up
+    # for WORKER_HEALTHY_AFTER - see the reset in main's recv path.
+    st.last_worker_revive = 0.0
     st.guide_fails = 0

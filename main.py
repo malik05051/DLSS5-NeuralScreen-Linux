@@ -88,7 +88,8 @@ import pipeline
 # The restart cooldown is the loop's business too: it is what the
 # deferred apply waits for.
 from pipeline import (AUTO_REVIVE_BACKOFF,  # noqa: F401
-                      MAX_CONSECUTIVE_RESTARTS, RESTART_COOLDOWN)
+                      MAX_CONSECUTIVE_RESTARTS, RESTART_COOLDOWN,
+                      WORKER_HEALTHY_AFTER)
 # The pieces below live in their own modules now; re-exported because
 # the rest of the program and the tests look them up in main.
 from paths import BASE_DIR, NATIVE_DIR, WORKER_EXE  # noqa: F401
@@ -253,6 +254,7 @@ class _Pipeline:
         "lang",
         "last_foreground",
         "last_restart",
+        "last_worker_revive",
         "mon_h",
         "mon_w",
         "monitor",
@@ -678,6 +680,8 @@ def main() -> int:
                     st.width if (st.work_w != st.width or st.work_h != st.height) else 0,
                     st.height if (st.work_w != st.width or st.work_h != st.height) else 0,
                     st.worker_stop, st.shm)
+                # The clock the restart counter's reset is measured against.
+                st.last_worker_revive = time.monotonic()
                 channels.forget_present(st)
                 channels.forget_dda(st)
                 channels.forget_out(st)
@@ -781,6 +785,8 @@ def main() -> int:
                     st.width if (st.work_w != st.width or st.work_h != st.height) else 0,
                     st.height if (st.work_w != st.width or st.work_h != st.height) else 0,
                     st.worker_stop, st.shm)
+                # The clock the restart counter's reset is measured against.
+                st.last_worker_revive = time.monotonic()
                 channels.forget_present(st)
                 channels.forget_dda(st)
                 channels.forget_out(st)
@@ -790,10 +796,19 @@ def main() -> int:
                 st.work_frame = None
                 continue
             _perf("recv", t0)
-            # A frame arrived - the failure chain is broken. Without the reset
-            # the counter accumulated across the whole session and three
-            # unrelated failures (even an hour apart) turned NR off.
-            st.consecutive_restarts = 0
+            # A frame arrived. Without any reset the counter accumulated
+            # across the whole session and three unrelated failures (even an
+            # hour apart) turned NR off - but one frame is too little to call
+            # the chain broken. A worker that comes up, delivers a frame and
+            # then goes silent cleared the counter on every cycle, so the
+            # give-up threshold was never reached and the restart (with its
+            # visible flicker) repeated every few seconds for as long as the
+            # program ran. The chain is broken once the worker has stayed up
+            # for WORKER_HEALTHY_AFTER; until then the count stands.
+            if (st.consecutive_restarts
+                    and time.monotonic() - st.last_worker_revive
+                    >= WORKER_HEALTHY_AFTER):
+                st.consecutive_restarts = 0
             status = "NR OFF" if st.paused else "NR ON"
             st.pts += 1
             if st.frame_index < 15 or st.frame_index % 30 == 0:
