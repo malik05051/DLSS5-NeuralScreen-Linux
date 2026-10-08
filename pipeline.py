@@ -295,6 +295,16 @@ RACK_TIMEOUT = 20.0     # seconds to wait for RACK after RNSZ
 # the worker is not coming back on its own, and spinning through restarts
 # only keeps the screen frozen. The user gets an alert instead.
 MAX_CONSECUTIVE_RESTARTS = 3
+
+# How long a revived worker has to keep delivering before the failure chain
+# counts as broken. A single frame is not enough evidence: a worker that
+# comes up, hands over one frame and then goes silent resets the counter
+# every time, so MAX_CONSECUTIVE_RESTARTS is never reached and the restart
+# repeats for as long as the program runs - a visible flicker every few
+# seconds, for ever, instead of a failure that is reported once (user
+# the-cave-dweller, issue #9: "continuously generates a flicker every 5-6
+# seconds that makes it unusable", on the Proton path).
+WORKER_HEALTHY_AFTER = 20.0  # seconds
 # A transient failure (no-frame, driver hiccup) gets ONE automatic revive
 # after this backoff instead of leaving NR off until the user presses Num1.
 # A hard failure (0xBAD00001) never auto-revives.
